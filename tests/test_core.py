@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from iaa_agent.cli import _resolve_user_target_index
 from iaa_agent.data import NYCDataRepository
 from iaa_agent.engine import IAAAgent, RunConfig
 from iaa_agent.utils import haversine_km
@@ -79,3 +80,10 @@ def test_user_chronological_query_and_run() -> None:
     assert payload["query_mode"] == "user_timeline"
     assert payload["ground_truth_poi_idx"].startswith("P")
     assert payload["ranked_pois"][0]["poi_idx"].startswith("P")
+
+
+def test_default_user_target_index_uses_last_held_out_event() -> None:
+    repo = NYCDataRepository("datasets/NYC")
+    info = repo.user_timeline_info("349", train_ratio=0.8)
+    assert _resolve_user_target_index(repo, "349", 0.8, None) == info["valid_target_index_end"]
+    assert _resolve_user_target_index(repo, "349", 0.8, 576) == 576

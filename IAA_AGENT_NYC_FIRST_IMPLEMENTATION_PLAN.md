@@ -22,7 +22,7 @@ as `missing_evidence` and must not be hallucinated in explanations.
 - `iaa-agent prepare --data-dir datasets/NYC`
 - `iaa-agent run --traj-id <test_trajectory_id> --out outputs/runs/<id>.json`
 - `iaa-agent user-targets --user-id <user_id>`
-- `iaa-agent run-user --user-id <user_id> --target-index <idx> --out outputs/runs/<id>.json`
+- `iaa-agent run-user --user-id <user_id> [--target-index <idx>] --out outputs/runs/<id>.json`
 - `iaa-agent replay --case cases/case_a.json`
 - `iaa-agent evaluate --limit 50`
 - `iaa-agent evaluate-user-split --limit 50`
@@ -35,7 +35,8 @@ network access. Live DeepSeek calls are enabled only with `--llm deepseek` and
 research/evaluation path is now user chronological splitting: sort each user's
 full check-in stream by time, use the first 80% as long-term history, and
 predict events in the remaining 20% with the preceding check-ins as short-term
-context.
+context. If `run-user` omits `--target-index`, it defaults to the user's last
+held-out event.
 
 Every POI has two IDs in outputs:
 

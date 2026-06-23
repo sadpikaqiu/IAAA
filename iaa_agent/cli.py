@@ -66,7 +66,10 @@ def user_targets(
 @app.command("run-user")
 def run_user(
     user_id: str = typer.Option(..., help="User id in the chronological user stream"),
-    target_index: int = typer.Option(..., help="0-based index in this user's full chronological check-in stream"),
+    target_index: Optional[int] = typer.Option(
+        None,
+        help="0-based index in this user's full chronological check-in stream; defaults to the last held-out event",
+    ),
     data_dir: str = typer.Option("datasets/NYC", help="Directory containing NYC_train/val/test.csv"),
     train_ratio: float = typer.Option(0.8, help="Per-user chronological train ratio"),
     context_size: int = typer.Option(5, help="Number of previous check-ins used as short-term context"),
@@ -76,9 +79,10 @@ def run_user(
     repo = NYCDataRepository(data_dir)
     repo.use_user_chronological_split(train_ratio)
     try:
+        resolved_target_index = _resolve_user_target_index(repo, user_id, train_ratio, target_index)
         query = repo.get_user_query(
             user_id=user_id,
-            target_index=target_index,
+            target_index=resolved_target_index,
             train_ratio=train_ratio,
             context_size=context_size,
         )
@@ -87,12 +91,14 @@ def run_user(
     agent = IAAAgent(repo, RunConfig(llm_mode=llm))
     result = agent.run_query(query)
     payload = result.model_dump(mode="json")
-    target = out or f"outputs/runs/user_{user_id}_idx_{target_index}.json"
+    target = out or f"outputs/runs/user_{user_id}_idx_{resolved_target_index}.json"
     write_json(target, payload)
     console.print(f"Wrote user-timeline run result to {target}")
     console.print({
         "query_id": payload["query_id"],
         "query_mode": payload["query_mode"],
+        "target_index": resolved_target_index,
+        "target_index_source": "default_tail" if target_index is None else "explicit",
         "ground_truth_poi_idx": payload["ground_truth_poi_idx"],
         "top1_poi_idx": payload["ranked_pois"][0]["poi_idx"] if payload["ranked_pois"] else None,
     })
@@ -158,3 +164,15 @@ def evaluate_user_split_command(
     write_json(out, payload)
     console.print(f"Wrote user-split evaluation results to {out}")
     console.print(payload)
+
+
+def _resolve_user_target_index(
+    repo: NYCDataRepository,
+    user_id: str,
+    train_ratio: float,
+    target_index: Optional[int],
+) -> int:
+    if target_index is not None:
+        return target_index
+    info = repo.user_timeline_info(user_id, train_ratio)
+    return int(info["valid_target_index_end"])

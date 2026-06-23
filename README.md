@@ -33,6 +33,7 @@ python -m pip install -e .
 python -m iaa_agent prepare --data-dir datasets/NYC
 python -m iaa_agent run --traj-id 349_52 --out outputs/runs/smoke_349_52.json
 python -m iaa_agent user-targets --user-id 349
+python -m iaa_agent run-user --user-id 349 --out outputs/runs/user_349_tail.json
 python -m iaa_agent run-user --user-id 349 --target-index 576 --out outputs/runs/user_349_576.json
 python -m iaa_agent replay --case cases/case_a.json
 python -m iaa_agent evaluate --limit 50
@@ -42,6 +43,8 @@ python -m iaa_agent evaluate-user-split --limit 50
 The default LLM mode is deterministic `fake`, so tests and normal smoke runs do not require network access.
 
 `run --traj-id` is kept for GETNext-style trajectory debugging. The recommended research interface is `run-user`, where each user is sorted chronologically, the first 80% of check-ins form the long-term profile, and held-out tail events are predicted one by one using the previous check-ins as short-term context.
+
+For `run-user`, `--target-index` is optional. If omitted, the CLI predicts the last held-out event for that user. Use `user-targets` first when you want to inspect the valid index range and choose a specific test point.
 
 Outputs expose both IDs:
 
