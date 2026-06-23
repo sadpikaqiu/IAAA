@@ -36,17 +36,26 @@ python -m iaa_agent user-targets --user-id 349
 python -m iaa_agent run-user --user-id 349 --out outputs/runs/user_349_tail.json
 python -m iaa_agent run-user --user-id 349 --target-index 576 --out outputs/runs/user_349_576.json
 python -m iaa_agent replay --case cases/case_a.json
+python -m iaa_agent evaluate --user-id 349 --out outputs/evaluation/user_349_session_results.json
 python -m iaa_agent evaluate
 python -m iaa_agent evaluate --smoke-limit 50
 ```
 
 The default LLM mode is deterministic `fake`, so tests and normal smoke runs do not require network access.
 
-`run --traj-id` is kept for GETNext-style trajectory debugging. The recommended research interface is `run-user`, where each user is sorted chronologically, the first 80% of check-ins form the long-term profile, and held-out tail events are predicted one by one using the previous check-ins as short-term context.
+`run --traj-id` is kept for GETNext-style trajectory debugging. `run-user` is for inspecting one event-level case and its full agent trace.
 
 For `run-user`, `--target-index` is optional. If omitted, the CLI predicts the last held-out event for that user. Use `user-targets` first when you want to inspect the valid index range and choose a specific test point.
 
-`evaluate` is the formal session-level evaluation path. It sorts each user's full check-in stream, uses the first 80% as long-term history, then evaluates original `trajectory_id` sessions whose final check-in falls in the held-out 20%. Each session contributes one prediction: previous check-ins in that trajectory are the short-term context, and the final check-in is the ground truth. Use `--smoke-limit` only for quick development runs; omit it for full-dataset evaluation.
+`evaluate` is the formal session-level evaluation path. It sorts each user's full check-in stream, uses the first 80% as long-term history, then evaluates original `trajectory_id` sessions whose final check-in falls in the held-out 20%. Each session contributes one prediction: previous check-ins in that trajectory are the short-term context, and the final check-in is the ground truth.
+
+Recommended evaluation workflow:
+
+- Unit logic tests: `python -m pytest -q`
+- Single-user evaluation: `python -m iaa_agent evaluate --user-id 349`
+- Full evaluation: `python -m iaa_agent evaluate`
+
+Use `--smoke-limit` only for quick development runs; omit it for full-dataset reporting.
 
 Outputs expose both IDs:
 

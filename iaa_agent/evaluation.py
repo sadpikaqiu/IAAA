@@ -36,11 +36,12 @@ def evaluate_session_split(
     train_ratio: float = 0.8,
     min_context: int = 1,
     smoke_limit: int | None = None,
+    user_id: str | int | None = None,
     llm_mode: str = "fake",
 ) -> EvaluationResult:
     repo.use_user_chronological_split(train_ratio)
     agent = IAAAgent(repo, RunConfig(llm_mode=llm_mode))
-    keys = repo.iter_session_test_keys(train_ratio=train_ratio, min_context=min_context)
+    keys = repo.iter_session_test_keys(train_ratio=train_ratio, min_context=min_context, user_id=user_id)
     if smoke_limit is not None:
         keys = keys[:smoke_limit]
     ranks: list[int | None] = []

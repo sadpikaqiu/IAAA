@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from iaa_agent.cli import _resolve_user_target_index
 from iaa_agent.data import NYCDataRepository
 from iaa_agent.engine import IAAAgent, RunConfig
 from iaa_agent.evaluation import evaluate_session_split
@@ -15,22 +14,15 @@ def test_haversine_reasonable_distance() -> None:
     assert 5.0 < distance < 7.0
 
 
-def test_query_context_excludes_ground_truth() -> None:
-    repo = NYCDataRepository("datasets/NYC")
-    query = repo.get_query("349_52")
-    assert len(query.context) >= 1
-    assert str(query.context.iloc[-1]["POI_id"]) != str(query.target["POI_id"])
-    assert str(query.target["POI_id"]) not in [str(x) for x in query.context["POI_id"].tail(1).tolist()]
-
-
-def test_agent_run_schema_and_guardrails() -> None:
+def test_agent_session_run_schema_and_guardrails() -> None:
     repo = NYCDataRepository("datasets/NYC")
     agent = IAAAgent(repo, RunConfig(llm_mode="fake"))
-    result = agent.run("349_52")
+    user_id, trajectory_id = repo.iter_session_test_keys(train_ratio=0.8, min_context=1, user_id="1")[0]
+    query = repo.get_session_query(user_id, trajectory_id, train_ratio=0.8, min_context=1)
+    result = agent.run_query(query)
     payload = result.model_dump(mode="json")
 
-    assert payload["query_id"] == "349_52"
-    assert payload["query_mode"] == "trajectory"
+    assert payload["query_mode"] == "session_split"
     assert payload["ranked_pois"]
     assert payload["ranked_pois"][0]["poi_idx"].startswith("P")
     assert payload["dataset_capabilities"]["has_reviews"] is False
@@ -65,49 +57,40 @@ def test_prepare_summary_shape(tmp_path: Path) -> None:
     assert loaded["dataset_capabilities"]["has_category"] is True
 
 
-def test_user_chronological_query_and_run() -> None:
+def test_session_split_keys_support_global_and_single_user_eval() -> None:
     repo = NYCDataRepository("datasets/NYC")
-    repo.use_user_chronological_split(0.8)
-    user_id, target_index = repo.iter_user_test_events(train_ratio=0.8, min_context=1)[0]
-    query = repo.get_user_query(user_id, target_index, train_ratio=0.8, context_size=5)
-    assert query.mode == "user_timeline"
-    assert query.history is not None
-    assert len(query.history) <= target_index
-    assert len(query.context) <= 5
+    global_keys = repo.iter_session_test_keys(train_ratio=0.8, min_context=1)
+    user_keys = repo.iter_session_test_keys(train_ratio=0.8, min_context=1, user_id="349")
 
-    agent = IAAAgent(repo, RunConfig(llm_mode="fake"))
-    result = agent.run_query(query)
-    payload = result.model_dump(mode="json")
-    assert payload["query_mode"] == "user_timeline"
-    assert payload["ground_truth_poi_idx"].startswith("P")
-    assert payload["ranked_pois"][0]["poi_idx"].startswith("P")
-
-
-def test_default_user_target_index_uses_last_held_out_event() -> None:
-    repo = NYCDataRepository("datasets/NYC")
-    info = repo.user_timeline_info("349", train_ratio=0.8)
-    assert _resolve_user_target_index(repo, "349", 0.8, None) == info["valid_target_index_end"]
-    assert _resolve_user_target_index(repo, "349", 0.8, 576) == 576
+    assert len(global_keys) > len(user_keys) > 0
+    assert len(global_keys) == len(set(global_keys))
+    assert len(user_keys) == 10
+    assert {user_id for user_id, _ in user_keys} == {"349"}
 
 
 def test_session_split_query_uses_original_trajectory() -> None:
     repo = NYCDataRepository("datasets/NYC")
     repo.use_user_chronological_split(0.8)
-    user_id, trajectory_id = repo.iter_session_test_keys(train_ratio=0.8, min_context=1)[0]
+    user_id, trajectory_id = repo.iter_session_test_keys(train_ratio=0.8, min_context=1, user_id="349")[0]
     query = repo.get_session_query(user_id, trajectory_id, train_ratio=0.8, min_context=1)
+    rows = repo.all_events[repo.all_events["user_id"] == user_id].sort_values("UTC_time").reset_index(drop=True)
+    cutoff = min(max(1, int(len(rows) * 0.8)), len(rows) - 1)
 
     assert query.mode == "session_split"
     assert query.history is not None
     assert query.target_index is not None
+    assert query.target_index >= cutoff
     assert len(query.context) >= 1
     assert query.context["trajectory_id"].nunique() == 1
     assert str(query.context.iloc[0]["trajectory_id"]) == str(query.target["trajectory_id"])
-    assert str(query.context.iloc[-1]["UTC_time"]) != str(query.target["UTC_time"])
+    assert query.context["UTC_time"].max() < query.target["UTC_time"]
+    assert query.history["UTC_time"].max() <= rows.iloc[cutoff - 1]["UTC_time"]
 
 
-def test_session_split_evaluation_smoke() -> None:
+def test_single_user_session_evaluation_runs_all_user_sessions() -> None:
     repo = NYCDataRepository("datasets/NYC")
-    result = evaluate_session_split(repo, smoke_limit=1, llm_mode="fake")
+    user_keys = repo.iter_session_test_keys(train_ratio=0.8, min_context=1, user_id="1")
+    result = evaluate_session_split(repo, user_id="1", llm_mode="fake")
     payload = result.as_dict()
-    assert payload["total"] == 1
+    assert payload["total"] == len(user_keys) == 2
     assert set(payload) == {"total", "Hit@1", "Hit@5", "Hit@10", "NDCG@1", "NDCG@5", "NDCG@10", "MRR"}

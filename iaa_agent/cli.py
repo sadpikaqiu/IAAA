@@ -123,6 +123,7 @@ def replay(
 @app.command(name="evaluate")
 def evaluate_command(
     data_dir: str = typer.Option("datasets/NYC", help="Directory containing NYC_train/val/test.csv"),
+    user_id: Optional[str] = typer.Option(None, help="Optional user id; evaluates all held-out sessions for that user"),
     train_ratio: float = typer.Option(0.8, help="Per-user chronological train ratio for long-term history"),
     min_context: int = typer.Option(1, help="Minimum visible check-ins before the session target"),
     smoke_limit: int = typer.Option(0, help="Optional session sample cap for smoke runs; 0 evaluates the full split"),
@@ -131,16 +132,21 @@ def evaluate_command(
 ) -> None:
     repo = NYCDataRepository(data_dir)
     actual_smoke_limit = None if smoke_limit == 0 else smoke_limit
-    result = evaluate_session_split(
-        repo,
-        train_ratio=train_ratio,
-        min_context=min_context,
-        smoke_limit=actual_smoke_limit,
-        llm_mode=llm,
-    )
+    try:
+        result = evaluate_session_split(
+            repo,
+            train_ratio=train_ratio,
+            min_context=min_context,
+            smoke_limit=actual_smoke_limit,
+            user_id=user_id,
+            llm_mode=llm,
+        )
+    except (KeyError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     payload = result.as_dict()
     payload["split"] = {
         "mode": "user_chronological_session",
+        "user_id": user_id,
         "train_ratio": train_ratio,
         "min_context": min_context,
         "session_source": "original trajectory_id",

@@ -24,7 +24,7 @@ as `missing_evidence` and must not be hallucinated in explanations.
 - `iaa-agent user-targets --user-id <user_id>`
 - `iaa-agent run-user --user-id <user_id> [--target-index <idx>] --out outputs/runs/<id>.json`
 - `iaa-agent replay --case cases/case_a.json`
-- `iaa-agent evaluate [--smoke-limit 50]`
+- `iaa-agent evaluate [--user-id <user_id>] [--smoke-limit 50]`
 
 The default LLM mode is `fake`, which is deterministic and does not require
 network access. Live DeepSeek calls are enabled only with `--llm deepseek` and
@@ -38,8 +38,15 @@ The formal evaluation path is session-level. It sorts each user's full check-in
 stream by time, uses the first 80% as long-term history, then evaluates original
 `trajectory_id` sessions whose final check-in falls in the held-out 20%. Each
 session contributes one prediction: previous check-ins in that trajectory are
-the short-term context, and the final check-in is the ground truth. `--smoke-limit`
-is only for quick development runs; full reporting should omit it.
+the short-term context, and the final check-in is the ground truth.
+
+Evaluation is organized into three levels:
+
+- Unit logic tests: `python -m pytest -q`
+- Single-user evaluation: `iaa-agent evaluate --user-id 349`
+- Full evaluation: `iaa-agent evaluate`
+
+`--smoke-limit` is only for quick development runs; full reporting should omit it.
 
 Every POI has two IDs in outputs:
 

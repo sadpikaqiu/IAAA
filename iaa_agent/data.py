@@ -142,9 +142,22 @@ class NYCDataRepository:
         keys.sort(key=lambda x: (x[0], x[1]))
         return keys
 
-    def iter_session_test_keys(self, train_ratio: float = 0.8, min_context: int = 1) -> list[tuple[str, str]]:
+    def iter_session_test_keys(
+        self,
+        train_ratio: float = 0.8,
+        min_context: int = 1,
+        user_id: str | int | None = None,
+    ) -> list[tuple[str, str]]:
         keys: list[tuple[pd.Timestamp, str, str]] = []
-        for user_id, rows in self.all_events.groupby("user_id", sort=False):
+        if user_id is None:
+            user_groups = self.all_events.groupby("user_id", sort=False)
+        else:
+            user_key = str(user_id)
+            rows = self.all_events[self.all_events["user_id"] == user_key]
+            if rows.empty:
+                raise KeyError(f"Unknown user id: {user_id}")
+            user_groups = [(user_key, rows)]
+        for current_user_id, rows in user_groups:
             ordered = rows.sort_values("UTC_time").reset_index(drop=True)
             if len(ordered) <= min_context:
                 continue
@@ -157,7 +170,7 @@ class NYCDataRepository:
                 target_index = int(session.index[-1])
                 if target_index < cutoff:
                     continue
-                keys.append((pd.Timestamp(target["UTC_time"]), str(user_id), str(trajectory_id)))
+                keys.append((pd.Timestamp(target["UTC_time"]), str(current_user_id), str(trajectory_id)))
         keys.sort(key=lambda x: (x[0], x[1], _trajectory_sort_key(x[2])))
         return [(user_id, trajectory_id) for _, user_id, trajectory_id in keys]
 
