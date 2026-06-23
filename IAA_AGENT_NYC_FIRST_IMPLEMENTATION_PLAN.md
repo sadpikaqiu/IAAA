@@ -24,7 +24,7 @@ as `missing_evidence` and must not be hallucinated in explanations.
 - `iaa-agent user-targets --user-id <user_id>`
 - `iaa-agent run-user --user-id <user_id> [--target-index <idx>] --out outputs/runs/<id>.json`
 - `iaa-agent replay --case cases/case_a.json`
-- `iaa-agent evaluate [--user-id <user_id>] [--smoke-limit 50]`
+- `iaa-agent evaluate [--user-id <user_id>] [--save-runs outputs/eval_runs/<id>] [--smoke-limit 50]`
 
 The default LLM mode is `fake`, which is deterministic and does not require
 network access. Live DeepSeek calls are enabled only with `--llm deepseek` and
@@ -44,8 +44,11 @@ Evaluation is organized into three levels:
 
 - Unit logic tests: `python -m pytest -q`
 - Single-user evaluation: `iaa-agent evaluate --user-id 349`
+- Single-user traces: `iaa-agent evaluate --user-id 349 --save-runs outputs/eval_runs/user_349`
 - Full evaluation: `iaa-agent evaluate`
 
+`--save-runs` writes each evaluated session's full `AgentRunResult` JSON and a
+directory-local `summary.json`, which supports case study and error analysis.
 `--smoke-limit` is only for quick development runs; full reporting should omit it.
 
 Every POI has two IDs in outputs:

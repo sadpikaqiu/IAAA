@@ -94,3 +94,19 @@ def test_single_user_session_evaluation_runs_all_user_sessions() -> None:
     payload = result.as_dict()
     assert payload["total"] == len(user_keys) == 2
     assert set(payload) == {"total", "Hit@1", "Hit@5", "Hit@10", "NDCG@1", "NDCG@5", "NDCG@10", "MRR"}
+
+
+def test_single_user_evaluation_can_save_full_traces(tmp_path: Path) -> None:
+    repo = NYCDataRepository("datasets/NYC")
+    result = evaluate_session_split(repo, user_id="1", save_runs_dir=tmp_path, llm_mode="fake")
+    payload = result.as_dict()
+
+    assert payload["total"] == 2
+    assert len(payload["runs"]) == 2
+    for record in payload["runs"]:
+        trace_path = Path(record["trace_path"])
+        assert trace_path.exists()
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        assert trace["query_mode"] == "session_split"
+        assert trace["agent_trace_summary"]
+        assert trace["ranked_pois"]

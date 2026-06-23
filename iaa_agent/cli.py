@@ -127,6 +127,7 @@ def evaluate_command(
     train_ratio: float = typer.Option(0.8, help="Per-user chronological train ratio for long-term history"),
     min_context: int = typer.Option(1, help="Minimum visible check-ins before the session target"),
     smoke_limit: int = typer.Option(0, help="Optional session sample cap for smoke runs; 0 evaluates the full split"),
+    save_runs: Optional[str] = typer.Option(None, help="Optional directory for per-session full AgentRunResult traces"),
     out: str = typer.Option("outputs/evaluation/session_split_results.json", help="Metrics JSON output"),
     llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
 ) -> None:
@@ -139,6 +140,7 @@ def evaluate_command(
             min_context=min_context,
             smoke_limit=actual_smoke_limit,
             user_id=user_id,
+            save_runs_dir=save_runs,
             llm_mode=llm,
         )
     except (KeyError, ValueError) as exc:
@@ -153,7 +155,11 @@ def evaluate_command(
         "smoke_limit": smoke_limit,
     }
     write_json(out, payload)
+    if save_runs is not None:
+        write_json(Path(save_runs) / "summary.json", payload)
     console.print(f"Wrote evaluation results to {out}")
+    if save_runs is not None:
+        console.print(f"Wrote per-session traces to {save_runs}")
     console.print(payload)
 
 

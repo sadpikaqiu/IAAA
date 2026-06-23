@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 from .data import NYCDataRepository
 from .engine import IAAAgent, RunConfig
+from .utils import write_json
 
 
 @dataclass
@@ -17,9 +19,10 @@ class EvaluationResult:
     ndcg_at_5: float
     ndcg_at_10: float
     mrr: float
+    run_records: list[dict] | None = None
 
     def as_dict(self) -> dict:
-        return {
+        payload = {
             "total": self.total,
             "Hit@1": self.hit_at_1,
             "Hit@5": self.hit_at_5,
@@ -29,6 +32,9 @@ class EvaluationResult:
             "NDCG@10": self.ndcg_at_10,
             "MRR": self.mrr,
         }
+        if self.run_records is not None:
+            payload["runs"] = self.run_records
+        return payload
 
 
 def evaluate_session_split(
@@ -37,6 +43,7 @@ def evaluate_session_split(
     min_context: int = 1,
     smoke_limit: int | None = None,
     user_id: str | int | None = None,
+    save_runs_dir: str | Path | None = None,
     llm_mode: str = "fake",
 ) -> EvaluationResult:
     repo.use_user_chronological_split(train_ratio)
@@ -45,6 +52,7 @@ def evaluate_session_split(
     if smoke_limit is not None:
         keys = keys[:smoke_limit]
     ranks: list[int | None] = []
+    run_records: list[dict] | None = [] if save_runs_dir is not None else None
     for user_id, trajectory_id in keys:
         query = repo.get_session_query(
             user_id=user_id,
@@ -57,7 +65,25 @@ def evaluate_session_split(
         predicted = [item.poi_id for item in result.ranked_pois]
         rank = predicted.index(gt) + 1 if gt in predicted else None
         ranks.append(rank)
-    return _metrics(ranks)
+        if save_runs_dir is not None and run_records is not None:
+            trace_path = Path(save_runs_dir) / f"user_{user_id}_session_{_safe_filename(trajectory_id)}.json"
+            write_json(trace_path, result.model_dump(mode="json"))
+            run_records.append(
+                {
+                    "user_id": str(user_id),
+                    "trajectory_id": str(trajectory_id),
+                    "query_id": result.query_id,
+                    "rank": rank,
+                    "ground_truth_poi_id": result.ground_truth_poi_id,
+                    "ground_truth_poi_idx": result.ground_truth_poi_idx,
+                    "top1_poi_id": result.ranked_pois[0].poi_id if result.ranked_pois else None,
+                    "top1_poi_idx": result.ranked_pois[0].poi_idx if result.ranked_pois else None,
+                    "trace_path": str(trace_path),
+                }
+            )
+    metrics = _metrics(ranks)
+    metrics.run_records = run_records
+    return metrics
 
 
 def _metrics(ranks: list[int | None]) -> EvaluationResult:
@@ -86,3 +112,8 @@ def _metrics(ranks: list[int | None]) -> EvaluationResult:
         ndcg_at_10=round(ndcg(10), 6),
         mrr=round(mrr, 6),
     )
+
+
+def _safe_filename(value: str | int) -> str:
+    text = str(value)
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)

@@ -37,6 +37,7 @@ python -m iaa_agent run-user --user-id 349 --out outputs/runs/user_349_tail.json
 python -m iaa_agent run-user --user-id 349 --target-index 576 --out outputs/runs/user_349_576.json
 python -m iaa_agent replay --case cases/case_a.json
 python -m iaa_agent evaluate --user-id 349 --out outputs/evaluation/user_349_session_results.json
+python -m iaa_agent evaluate --user-id 349 --save-runs outputs/eval_runs/user_349
 python -m iaa_agent evaluate
 python -m iaa_agent evaluate --smoke-limit 50
 ```
@@ -53,9 +54,10 @@ Recommended evaluation workflow:
 
 - Unit logic tests: `python -m pytest -q`
 - Single-user evaluation: `python -m iaa_agent evaluate --user-id 349`
+- Single-user traces: `python -m iaa_agent evaluate --user-id 349 --save-runs outputs/eval_runs/user_349`
 - Full evaluation: `python -m iaa_agent evaluate`
 
-Use `--smoke-limit` only for quick development runs; omit it for full-dataset reporting.
+Use `--save-runs` when you need per-session `AgentRunResult` JSON files for case study and error analysis. Use `--smoke-limit` only for quick development runs; omit it for full-dataset reporting.
 
 Outputs expose both IDs:
 
