@@ -28,7 +28,9 @@ def test_agent_run_schema_and_guardrails() -> None:
     payload = result.model_dump(mode="json")
 
     assert payload["query_id"] == "349_52"
+    assert payload["query_mode"] == "trajectory"
     assert payload["ranked_pois"]
+    assert payload["ranked_pois"][0]["poi_idx"].startswith("P")
     assert payload["dataset_capabilities"]["has_reviews"] is False
     assert payload["dataset_capabilities"]["has_images"] is False
     assert payload["dataset_capabilities"]["has_opening_hours"] is False
@@ -60,3 +62,20 @@ def test_prepare_summary_shape(tmp_path: Path) -> None:
     assert loaded["train"]["rows"] > loaded["test"]["rows"]
     assert loaded["dataset_capabilities"]["has_category"] is True
 
+
+def test_user_chronological_query_and_run() -> None:
+    repo = NYCDataRepository("datasets/NYC")
+    repo.use_user_chronological_split(0.8)
+    user_id, target_index = repo.iter_user_test_events(train_ratio=0.8, min_context=1)[0]
+    query = repo.get_user_query(user_id, target_index, train_ratio=0.8, context_size=5)
+    assert query.mode == "user_timeline"
+    assert query.history is not None
+    assert len(query.history) <= target_index
+    assert len(query.context) <= 5
+
+    agent = IAAAgent(repo, RunConfig(llm_mode="fake"))
+    result = agent.run_query(query)
+    payload = result.model_dump(mode="json")
+    assert payload["query_mode"] == "user_timeline"
+    assert payload["ground_truth_poi_idx"].startswith("P")
+    assert payload["ranked_pois"][0]["poi_idx"].startswith("P")

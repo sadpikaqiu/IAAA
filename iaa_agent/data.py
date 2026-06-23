@@ -33,6 +33,9 @@ class QueryExample:
     traj_id: str
     context: pd.DataFrame
     target: pd.Series
+    mode: str = "trajectory"
+    history: pd.DataFrame | None = None
+    target_index: int | None = None
 
 
 class NYCDataRepository:
@@ -41,6 +44,11 @@ class NYCDataRepository:
         self.train = self._load_split("train")
         self.val = self._load_split("val")
         self.test = self._load_split("test")
+        self._build_poi_index()
+        self.train = self._attach_poi_idx(self.train)
+        self.val = self._attach_poi_idx(self.val)
+        self.test = self._attach_poi_idx(self.test)
+        self.all_events = pd.concat([self.train, self.val, self.test], ignore_index=True).sort_values("UTC_time").reset_index(drop=True)
         self.history = pd.concat([self.train, self.val], ignore_index=True)
         self._catalog = self._build_catalog(self.history)
         self._all_meta = self._build_catalog(pd.concat([self.history, self.test], ignore_index=True))
@@ -50,6 +58,7 @@ class NYCDataRepository:
         self._global_poi_transitions: dict[tuple[str, str], int] | None = None
         self._peer_vectors: dict[str, dict[str, float]] | None = None
         self._peer_cells: dict[str, set[str]] | None = None
+        self._active_history_mode = "global_train_val"
 
     @property
     def capabilities(self) -> DatasetCapabilities:
@@ -82,6 +91,11 @@ class NYCDataRepository:
                 "min_utc_time": str(df["UTC_time"].min()),
                 "max_utc_time": str(df["UTC_time"].max()),
             }
+        out["poi_id_mapping"] = {
+            "count": len(self._poi_id_to_idx),
+            "format": "P000001-style stable IDs sorted by original Foursquare POI_id",
+        }
+        out["active_history_mode"] = self._active_history_mode
         out["dataset_capabilities"] = self.capabilities.model_dump()
         return out
 
@@ -95,10 +109,102 @@ class NYCDataRepository:
         group = self._test_groups[key].sort_values("UTC_time").reset_index(drop=True)
         if len(group) < 2:
             raise ValueError(f"Trajectory {traj_id} has fewer than 2 check-ins")
-        return QueryExample(traj_id=key, context=group.iloc[:-1].copy(), target=group.iloc[-1].copy())
+        return QueryExample(traj_id=key, context=group.iloc[:-1].copy(), target=group.iloc[-1].copy(), mode="trajectory")
 
-    def history_for_user(self, user_id: str | int, context: pd.DataFrame | None = None) -> pd.DataFrame:
-        base = self._history_by_user.get(str(user_id), pd.DataFrame(columns=self.history.columns)).copy()
+    def use_user_chronological_split(self, train_ratio: float = 0.8) -> None:
+        """Use each user's first train_ratio events as the active global history."""
+        if not 0 < train_ratio < 1:
+            raise ValueError("train_ratio must be between 0 and 1")
+        parts = []
+        for _, rows in self.all_events.groupby("user_id", sort=False):
+            ordered = rows.sort_values("UTC_time").reset_index(drop=True)
+            cutoff = max(1, int(len(ordered) * train_ratio))
+            if len(ordered) >= 2:
+                cutoff = min(cutoff, len(ordered) - 1)
+            parts.append(ordered.iloc[:cutoff].copy())
+        self.history = pd.concat(parts, ignore_index=True).sort_values("UTC_time").reset_index(drop=True) if parts else self.history.iloc[:0].copy()
+        self._catalog = self._build_catalog(self.history)
+        self._history_by_user = {str(k): v.copy() for k, v in self.history.groupby("user_id", sort=False)}
+        self._reset_history_caches()
+        self._active_history_mode = f"user_chronological_{train_ratio:.3f}"
+
+    def iter_user_test_events(self, train_ratio: float = 0.8, min_context: int = 1) -> list[tuple[str, int]]:
+        keys: list[tuple[str, int]] = []
+        for user_id, rows in self.all_events.groupby("user_id", sort=False):
+            ordered = rows.sort_values("UTC_time").reset_index(drop=True)
+            if len(ordered) <= min_context:
+                continue
+            cutoff = max(min_context, int(len(ordered) * train_ratio))
+            cutoff = min(cutoff, len(ordered) - 1)
+            for idx in range(cutoff, len(ordered)):
+                if idx >= min_context:
+                    keys.append((str(user_id), int(idx)))
+        keys.sort(key=lambda x: (x[0], x[1]))
+        return keys
+
+    def get_user_query(
+        self,
+        user_id: str | int,
+        target_index: int,
+        train_ratio: float = 0.8,
+        context_size: int = 5,
+        require_test_index: bool = True,
+    ) -> QueryExample:
+        user_key = str(user_id)
+        rows = self.all_events[self.all_events["user_id"] == user_key].sort_values("UTC_time").reset_index(drop=True)
+        if rows.empty:
+            raise KeyError(f"Unknown user id: {user_id}")
+        if target_index < 1 or target_index >= len(rows):
+            raise ValueError(f"target_index must be in [1, {len(rows) - 1}] for user {user_id}")
+        cutoff = max(1, int(len(rows) * train_ratio))
+        cutoff = min(cutoff, len(rows) - 1)
+        if require_test_index and target_index < cutoff:
+            raise ValueError(
+                f"target_index {target_index} is before the user split cutoff {cutoff}; "
+                "choose an index in the held-out tail or set require_test_index=False"
+            )
+        start = max(0, target_index - context_size)
+        context = rows.iloc[start:target_index].copy()
+        history = rows.iloc[:cutoff].copy()
+        query_id = f"user_{user_key}_idx_{target_index}"
+        return QueryExample(
+            traj_id=query_id,
+            context=context,
+            target=rows.iloc[target_index].copy(),
+            mode="user_timeline",
+            history=history,
+            target_index=target_index,
+        )
+
+    def user_timeline_info(self, user_id: str | int, train_ratio: float = 0.8) -> dict:
+        user_key = str(user_id)
+        rows = self.all_events[self.all_events["user_id"] == user_key].sort_values("UTC_time").reset_index(drop=True)
+        if rows.empty:
+            raise KeyError(f"Unknown user id: {user_id}")
+        cutoff = max(1, int(len(rows) * train_ratio))
+        cutoff = min(cutoff, len(rows) - 1)
+        first_test = rows.iloc[cutoff]
+        last_test = rows.iloc[-1]
+        return {
+            "user_id": user_key,
+            "num_checkins": int(len(rows)),
+            "train_ratio": train_ratio,
+            "train_cutoff_index": int(cutoff),
+            "valid_target_index_start": int(cutoff),
+            "valid_target_index_end": int(len(rows) - 1),
+            "first_test_time": pd.Timestamp(first_test["local_time"]).isoformat(),
+            "last_test_time": pd.Timestamp(last_test["local_time"]).isoformat(),
+            "first_test_poi_idx": str(first_test["POI_idx"]),
+            "last_test_poi_idx": str(last_test["POI_idx"]),
+        }
+
+    def history_for_user(
+        self,
+        user_id: str | int,
+        context: pd.DataFrame | None = None,
+        base_history: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        base = base_history.copy() if base_history is not None else self._history_by_user.get(str(user_id), pd.DataFrame(columns=self.history.columns)).copy()
         if context is not None and len(context):
             visible = context.copy()
             return pd.concat([base, visible], ignore_index=True).sort_values("UTC_time").reset_index(drop=True)
@@ -120,7 +226,8 @@ class NYCDataRepository:
         if match.empty:
             return {
                 "POI_id": poi_id,
-                "display_name": poi_id,
+                "POI_idx": self.poi_idx(poi_id),
+                "display_name": self.poi_idx(poi_id),
                 "category": "Unknown",
                 "latitude": 0.0,
                 "longitude": 0.0,
@@ -129,12 +236,19 @@ class NYCDataRepository:
         row = match.iloc[0]
         return {
             "POI_id": str(row["POI_id"]),
-            "display_name": str(row["POI_id"]),
+            "POI_idx": str(row.get("POI_idx", self.poi_idx(str(row["POI_id"])))),
+            "display_name": str(row.get("POI_idx", self.poi_idx(str(row["POI_id"])))),
             "category": str(row["category"]),
             "latitude": float(row["latitude"]),
             "longitude": float(row["longitude"]),
             "visit_count": int(row.get("visit_count", 0)),
         }
+
+    def poi_idx(self, poi_id: str) -> str:
+        return self._poi_id_to_idx.get(str(poi_id), "P000000")
+
+    def original_poi_id(self, poi_idx: str) -> str | None:
+        return self._poi_idx_to_id.get(str(poi_idx))
 
     def nearest_pois(
         self,
@@ -233,10 +347,11 @@ class NYCDataRepository:
 
     def _build_catalog(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
-            return pd.DataFrame(columns=["POI_id", "category", "latitude", "longitude", "visit_count"])
+            return pd.DataFrame(columns=["POI_id", "POI_idx", "category", "latitude", "longitude", "visit_count"])
         grouped = (
             df.groupby("POI_id")
             .agg(
+                POI_idx=("POI_idx", "first"),
                 category=("POI_catname", lambda s: s.mode().iloc[0] if len(s.mode()) else s.iloc[0]),
                 latitude=("latitude", "median"),
                 longitude=("longitude", "median"),
@@ -244,8 +359,25 @@ class NYCDataRepository:
             )
             .reset_index()
         )
-        grouped["display_name"] = grouped["POI_id"]
+        grouped["display_name"] = grouped["POI_idx"]
         return grouped
+
+    def _build_poi_index(self) -> None:
+        all_rows = pd.concat([self.train, self.val, self.test], ignore_index=True)
+        poi_ids = sorted(str(x) for x in all_rows["POI_id"].dropna().unique())
+        self._poi_id_to_idx = {poi_id: f"P{i + 1:06d}" for i, poi_id in enumerate(poi_ids)}
+        self._poi_idx_to_id = {idx: poi_id for poi_id, idx in self._poi_id_to_idx.items()}
+
+    def _attach_poi_idx(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        out["POI_idx"] = out["POI_id"].map(self._poi_id_to_idx).fillna("P000000")
+        return out
+
+    def _reset_history_caches(self) -> None:
+        self._global_category_transitions = None
+        self._global_poi_transitions = None
+        self._peer_vectors = None
+        self._peer_cells = None
 
     def _transition_counts(self, column: str) -> dict[tuple[str, str], int]:
         counts: dict[tuple[str, str], int] = {}
@@ -260,6 +392,7 @@ class NYCDataRepository:
         return CheckIn(
             user_id=str(row["user_id"]),
             poi_id=str(row["POI_id"]),
+            poi_idx=str(row.get("POI_idx", self.poi_idx(str(row["POI_id"])))),
             category=str(row["POI_catname"]),
             latitude=float(row["latitude"]),
             longitude=float(row["longitude"]),
@@ -277,4 +410,3 @@ def _trajectory_sort_key(value: str) -> tuple[int, str]:
         return (int(value.split("_")[-1]), value)
     except Exception:
         return (10**9, value)
-

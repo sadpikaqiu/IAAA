@@ -67,6 +67,9 @@ class IAAAgent:
 
     def run(self, traj_id: str) -> AgentRunResult:
         query = self.repo.get_query(traj_id)
+        return self.run_query(query)
+
+    def run_query(self, query: QueryExample) -> AgentRunResult:
         trace: list[ToolCallRecord] = []
 
         context = self._build_context(query)
@@ -166,9 +169,11 @@ class IAAAgent:
 
         return AgentRunResult(
             query_id=query.traj_id,
+            query_mode=query.mode,
             user_id=str(query.target["user_id"]),
             target_time=pd.Timestamp(query.target["local_time"]).isoformat(),
             ground_truth_poi_id=str(query.target["POI_id"]),
+            ground_truth_poi_idx=self.repo.poi_idx(str(query.target["POI_id"])),
             dataset_capabilities=self.repo.capabilities,
             context_snapshot=context,
             user_profile=profile,
@@ -207,8 +212,10 @@ class IAAAgent:
             time_of_day_bucket=time_bucket_label(int(target["hour"])),
             query_trajectory=self.repo.to_checkins(context),
             recent_poi_sequence=[str(x) for x in recent["POI_id"].tolist()],
+            recent_poi_idx_sequence=[str(x) for x in recent["POI_idx"].tolist()],
             recent_category_sequence=[str(x) for x in recent["POI_catname"].tolist()],
             last_known_poi=str(last["POI_id"]),
+            last_known_poi_idx=str(last["POI_idx"]),
             last_known_category=str(last["POI_catname"]),
             last_known_location={"latitude": float(last["latitude"]), "longitude": float(last["longitude"])},
             time_gap_since_last_checkin_minutes=float(gap_minutes),
@@ -218,11 +225,11 @@ class IAAAgent:
         )
 
     def _build_user_profile(self, query: QueryExample) -> UserProfile:
-        rows = self.repo.history_for_user(query.target["user_id"], query.context)
+        rows = self._history_for_query(query)
         if rows.empty:
             rows = query.context.copy()
         top_pois = [
-            {"poi_id": str(k), "count": int(v)}
+            {"poi_id": str(k), "poi_idx": self.repo.poi_idx(str(k)), "count": int(v)}
             for k, v in rows["POI_id"].value_counts().head(10).items()
         ]
         top_categories = [
@@ -440,6 +447,7 @@ class IAAAgent:
                 poi_id,
                 {
                     "poi_id": poi_id,
+                    "poi_idx": meta["POI_idx"],
                     "display_name": meta["display_name"],
                     "category": meta["category"],
                     "latitude": meta["latitude"],
@@ -450,7 +458,7 @@ class IAAAgent:
             )
             item["source_scores"][source] = max(float(score), item["source_scores"].get(source, 0.0))
 
-        user_rows = self.repo.history_for_user(query.target["user_id"], query.context)
+        user_rows = self._history_for_query(query)
         target_hb = context.target_hour // 3
         hist_scores = self._historical_scores(user_rows, context)
         for poi_id, score in hist_scores[:limit]:
@@ -544,7 +552,7 @@ class IAAAgent:
         intention: Intention,
         peers: list[tuple[str, float]],
     ) -> list[AffordanceProfile]:
-        user_rows = self.repo.history_for_user(query.target["user_id"], query.context)
+        user_rows = self._history_for_query(query)
         peer_rows = self._peer_rows_near_target(peers, pd.Timestamp(query.target["local_time"]))
         profiles = [
             self._candidate_affordance(candidate, user_rows, peer_rows, context, profile, intention)
@@ -582,6 +590,7 @@ class IAAAgent:
         conf = min(0.95, max(0.2, (sum(positive) / len(positive) if positive else 0.3) * (0.85 if conflicts else 1.0)))
         return AffordanceProfile(
             poi_id=candidate.poi_id,
+            poi_idx=candidate.poi_idx,
             display_name=candidate.display_name,
             category=candidate.category,
             distance_km=round(candidate.distance_km, 3),
@@ -641,6 +650,7 @@ class IAAAgent:
                 RankedPOI(
                     rank=idx,
                     poi_id=profile.poi_id,
+                    poi_idx=profile.poi_idx,
                     display_name=profile.display_name,
                     category=profile.category,
                     distance_km=profile.distance_km,
@@ -858,6 +868,13 @@ class IAAAgent:
             for hb, count in by_hour.items()
         }
 
+    def _history_for_query(self, query: QueryExample) -> pd.DataFrame:
+        return self.repo.history_for_user(
+            query.target["user_id"],
+            query.context,
+            base_history=query.history,
+        )
+
 
 def _verdict(
     name: str,
@@ -896,4 +913,3 @@ def _tool_record(state: str, tool: str, count: int, params: dict | None = None) 
         params=params or {},
         observations=[f"{count} records/candidates observed"],
     )
-

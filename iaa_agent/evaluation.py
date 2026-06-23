@@ -46,6 +46,34 @@ def evaluate(repo: NYCDataRepository, limit: int | None = 50, llm_mode: str = "f
     return _metrics(ranks)
 
 
+def evaluate_user_split(
+    repo: NYCDataRepository,
+    limit: int | None = 50,
+    train_ratio: float = 0.8,
+    context_size: int = 5,
+    llm_mode: str = "fake",
+) -> EvaluationResult:
+    repo.use_user_chronological_split(train_ratio)
+    agent = IAAAgent(repo, RunConfig(llm_mode=llm_mode))
+    keys = repo.iter_user_test_events(train_ratio=train_ratio, min_context=1)
+    if limit is not None:
+        keys = keys[:limit]
+    ranks: list[int | None] = []
+    for user_id, target_index in keys:
+        query = repo.get_user_query(
+            user_id=user_id,
+            target_index=target_index,
+            train_ratio=train_ratio,
+            context_size=context_size,
+        )
+        result = agent.run_query(query)
+        gt = result.ground_truth_poi_id
+        predicted = [item.poi_id for item in result.ranked_pois]
+        rank = predicted.index(gt) + 1 if gt in predicted else None
+        ranks.append(rank)
+    return _metrics(ranks)
+
+
 def _metrics(ranks: list[int | None]) -> EvaluationResult:
     n = len(ranks)
     if n == 0:
@@ -72,4 +100,3 @@ def _metrics(ranks: list[int | None]) -> EvaluationResult:
         ndcg_at_10=round(ndcg(10), 6),
         mrr=round(mrr, 6),
     )
-

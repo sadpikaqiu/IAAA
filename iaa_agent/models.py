@@ -24,6 +24,7 @@ class DatasetCapabilities(BaseModel):
 class CheckIn(BaseModel):
     user_id: str
     poi_id: str
+    poi_idx: str
     category: str
     latitude: float
     longitude: float
@@ -45,8 +46,10 @@ class ContextSnapshot(BaseModel):
     time_of_day_bucket: str
     query_trajectory: list[CheckIn]
     recent_poi_sequence: list[str]
+    recent_poi_idx_sequence: list[str] = Field(default_factory=list)
     recent_category_sequence: list[str]
     last_known_poi: str
+    last_known_poi_idx: str = ""
     last_known_category: str
     last_known_location: dict[str, float]
     time_gap_since_last_checkin_minutes: float
@@ -110,6 +113,7 @@ class ToolCallRecord(BaseModel):
 
 class Candidate(BaseModel):
     poi_id: str
+    poi_idx: str
     display_name: str
     category: str
     latitude: float
@@ -133,6 +137,7 @@ class AffordanceVerdict(BaseModel):
 
 class AffordanceProfile(BaseModel):
     poi_id: str
+    poi_idx: str
     display_name: str
     category: str
     distance_km: float
@@ -147,6 +152,7 @@ class AffordanceProfile(BaseModel):
 class RankedPOI(BaseModel):
     rank: int
     poi_id: str
+    poi_idx: str
     display_name: str
     category: str
     distance_km: float
@@ -171,9 +177,11 @@ class AgentRunResult(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     query_id: str
+    query_mode: str = "trajectory"
     user_id: str
     target_time: str
     ground_truth_poi_id: str | None
+    ground_truth_poi_idx: str | None = None
     dataset_capabilities: DatasetCapabilities
     context_snapshot: ContextSnapshot
     user_profile: UserProfile
@@ -183,4 +191,3 @@ class AgentRunResult(BaseModel):
     ranked_pois: list[RankedPOI]
     reflection: ReflectionRecord
     agent_trace_summary: list[ToolCallRecord]
-
