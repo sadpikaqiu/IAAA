@@ -52,6 +52,7 @@ class NYCDataRepository:
         self.history = pd.concat([self.train, self.val], ignore_index=True)
         self._catalog = self._build_catalog(self.history)
         self._all_meta = self._build_catalog(pd.concat([self.history, self.test], ignore_index=True))
+        self._all_meta["visit_count"] = 0
         self._history_by_user = {str(k): v.copy() for k, v in self.history.groupby("user_id", sort=False)}
         self._test_groups = {str(k): v.copy() for k, v in self.test.groupby("trajectory_id", sort=False)}
         self._global_category_transitions: dict[tuple[str, str], int] | None = None
@@ -277,11 +278,13 @@ class NYCDataRepository:
             return merged.sort_values("UTC_time").reset_index(drop=True)
         return base.sort_values("UTC_time").reset_index(drop=True)
 
-    def runtime_catalog(self, context: pd.DataFrame | None = None) -> pd.DataFrame:
-        if context is None or context.empty:
-            return self.catalog
-        visible = self._build_catalog(context)
-        merged = pd.concat([self._catalog, visible], ignore_index=True)
+    def runtime_catalog(self, context: pd.DataFrame | None = None, include_unvisited: bool = False) -> pd.DataFrame:
+        catalogs = [self._catalog]
+        if context is not None and not context.empty:
+            catalogs.append(self._build_catalog(context))
+        if include_unvisited:
+            catalogs.append(self._all_meta)
+        merged = pd.concat(catalogs, ignore_index=True)
         merged = merged.sort_values("visit_count", ascending=False).drop_duplicates("POI_id", keep="first")
         return merged.reset_index(drop=True)
 
@@ -324,8 +327,9 @@ class NYCDataRepository:
         limit: int = 50,
         context: pd.DataFrame | None = None,
         exclude: Iterable[str] | None = None,
+        include_unvisited: bool = False,
     ) -> pd.DataFrame:
-        catalog = self.runtime_catalog(context)
+        catalog = self.runtime_catalog(context, include_unvisited=include_unvisited)
         excluded = set(exclude or [])
         if excluded:
             catalog = catalog[~catalog["POI_id"].isin(excluded)].copy()

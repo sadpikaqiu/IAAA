@@ -20,6 +20,7 @@ class EvaluationResult:
     ndcg_at_10: float
     mrr: float
     run_records: list[dict] | None = None
+    llm_usage: dict[str, int] | None = None
 
     def as_dict(self) -> dict:
         payload = {
@@ -34,6 +35,8 @@ class EvaluationResult:
         }
         if self.run_records is not None:
             payload["runs"] = self.run_records
+        if self.llm_usage is not None:
+            payload["llm_usage"] = self.llm_usage
         return payload
 
 
@@ -68,6 +71,7 @@ def evaluate_session_split(
         if save_runs_dir is not None and run_records is not None:
             trace_path = Path(save_runs_dir) / f"user_{user_id}_session_{_safe_filename(trajectory_id)}.json"
             write_json(trace_path, result.model_dump(mode="json"))
+            deepseek_usage = agent.llm.last_usage
             run_records.append(
                 {
                     "user_id": str(user_id),
@@ -78,11 +82,14 @@ def evaluate_session_split(
                     "ground_truth_poi_idx": result.ground_truth_poi_idx,
                     "top1_poi_id": result.ranked_pois[0].poi_id if result.ranked_pois else None,
                     "top1_poi_idx": result.ranked_pois[0].poi_idx if result.ranked_pois else None,
+                    "deepseek_usage": deepseek_usage,
                     "trace_path": str(trace_path),
                 }
             )
     metrics = _metrics(ranks)
     metrics.run_records = run_records
+    if any(agent.llm.usage_totals.values()):
+        metrics.llm_usage = agent.llm.usage_totals
     return metrics
 
 

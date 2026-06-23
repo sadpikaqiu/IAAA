@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Iterable
@@ -44,6 +45,45 @@ MISSING_EVIDENCE = [
     "price unavailable",
     "ratings unavailable",
 ]
+
+
+DEEPSEEK_INTENTION_CACHE_PREFIX = """
+You are the intention module for IAA-Agent, a next-POI recommendation agent.
+Use only structured Foursquare mobility evidence. Do not infer reviews, images,
+opening hours, price, ratings, crowding, atmosphere, or POI names that are not
+present in the input data.
+
+Return one strict JSON object matching this schema:
+{
+  "summary": "short text",
+  "activity_goal": "short text",
+  "likely_categories": [
+    {"category": "category string", "weight": 0.0, "evidence": "short text"}
+  ],
+  "spatial_preference": {
+    "anchor": "last_known_location",
+    "preferred_radius_km": 0.0,
+    "allow_long_distance": false,
+    "evidence": "short text"
+  },
+  "temporal_preference": {
+    "target_hour": 0,
+    "target_day_of_week": 0,
+    "preferred_time_bucket": "morning/noon/afternoon/evening/night/late_night",
+    "evidence": "short text"
+  },
+  "behavioral_preference": {
+    "revisit_tendency": 0.0,
+    "exploration_tendency": 0.0,
+    "peer_dependency": 0.0
+  },
+  "confidence": 0.0,
+  "evidence": ["short evidence strings"],
+  "uncertainty_reasons": ["short uncertainty strings"]
+}
+
+The next message contains the dynamic query data. Return JSON only.
+""".strip()
 
 
 @dataclass
@@ -111,15 +151,24 @@ class IAAAgent:
         )
 
         intention = self._infer_intention(context, profile, peers, query)
+        llm_usage = self.llm.last_usage if self.config.llm_mode == "deepseek" else None
+        intention_observations = [
+            intention.summary,
+            f"confidence={intention.confidence:.2f}",
+        ]
+        intention_params = {"llm_mode": self.config.llm_mode}
+        if llm_usage:
+            hit = llm_usage.get("prompt_cache_hit_tokens", 0)
+            miss = llm_usage.get("prompt_cache_miss_tokens", 0)
+            intention_params["deepseek_usage"] = llm_usage
+            intention_observations.append(f"DeepSeek cache hit/miss tokens: {hit}/{miss}")
         trace.append(
             ToolCallRecord(
                 state="S1_INTENTION_INFERRED",
                 tool="InferIntention",
                 reason="Infer structured user intention before selecting candidates.",
-                observations=[
-                    intention.summary,
-                    f"confidence={intention.confidence:.2f}",
-                ],
+                params=intention_params,
+                observations=intention_observations,
             )
         )
 
@@ -299,9 +348,10 @@ class IAAAgent:
         heuristic = self._heuristic_intention(context, profile, peers, query)
         if self.config.llm_mode != "deepseek" or not self.llm.available:
             return heuristic
+        stable_profile = self._stable_profile_for_llm_cache(query)
         prompt = {
-            "context": context.model_dump(),
-            "user_profile": profile.model_dump(),
+            "context": context.model_dump(mode="json"),
+            "peer_users": [{"user_id": uid, "score": round(score, 6)} for uid, score in peers],
             "allowed_categories": [x["category"] for x in profile.top_categories[:10]],
             "instruction": "Return a strict JSON Intention object. Use only available dataset evidence.",
         }
@@ -311,10 +361,36 @@ class IAAAgent:
                     "role": "system",
                     "content": "You infer structured next-POI intention from Foursquare mobility evidence. Return JSON only.",
                 },
-                {"role": "user", "content": str(prompt)},
+                {"role": "user", "content": DEEPSEEK_INTENTION_CACHE_PREFIX},
+                {"role": "user", "content": "Stable long-term user profile:\n" + json.dumps(stable_profile, ensure_ascii=False, sort_keys=True)},
+                {"role": "user", "content": "Dynamic session query:\n" + json.dumps(prompt, ensure_ascii=False, sort_keys=True)},
             ]
         )
         return parse_intention_or_none(data) or heuristic
+
+    def _stable_profile_for_llm_cache(self, query: QueryExample) -> dict:
+        if query.history is not None and not query.history.empty:
+            rows = query.history.copy()
+        else:
+            rows = self.repo.history_for_user(query.target["user_id"])
+        rows = rows.sort_values("UTC_time").reset_index(drop=True)
+        if rows.empty:
+            return {"user_id": str(query.target["user_id"]), "num_checkins": 0}
+        return {
+            "user_id": str(query.target["user_id"]),
+            "num_checkins": int(len(rows)),
+            "num_trajectories": int(rows["trajectory_id"].nunique()),
+            "top_pois": [
+                {"poi_idx": self.repo.poi_idx(str(poi_id)), "count": int(count)}
+                for poi_id, count in rows["POI_id"].value_counts().head(20).items()
+            ],
+            "top_categories": [
+                {"category": str(category), "count": int(count)}
+                for category, count in rows["POI_catname"].value_counts().head(20).items()
+            ],
+            "hour_distribution": {str(int(k)): int(v) for k, v in rows["hour"].value_counts().sort_index().items()},
+            "day_distribution": {str(int(k)): int(v) for k, v in rows["day_of_week"].value_counts().sort_index().items()},
+        }
 
     def _heuristic_intention(
         self,
@@ -470,6 +546,7 @@ class IAAAgent:
             context.last_known_location["longitude"],
             limit=spatial_top,
             context=query.context,
+            include_unvisited=True,
         )
         for _, row in nearest.iterrows():
             add_candidate(str(row["POI_id"]), safe_div(10.0, max(float(row["distance_km"]), 0.05)), "spatial", float(row["distance_km"]))
@@ -477,15 +554,24 @@ class IAAAgent:
 
         likely_categories = [x.category for x in intention.likely_categories]
         family_set = {category_family(x) for x in likely_categories}
-        catalog = self.repo.runtime_catalog(query.context)
+        catalog = self.repo.runtime_catalog(query.context, include_unvisited=True)
         cat_pool = catalog[
             catalog["category"].isin(likely_categories)
             | catalog["category"].map(category_family).isin(family_set)
         ].copy()
         if not cat_pool.empty:
-            cat_pool["score"] = cat_pool["visit_count"].astype(float)
+            cat_pool["distance_km"] = [
+                haversine_km(
+                    context.last_known_location["latitude"],
+                    context.last_known_location["longitude"],
+                    float(row.latitude),
+                    float(row.longitude),
+                )
+                for row in cat_pool.itertuples(index=False)
+            ]
+            cat_pool["score"] = cat_pool["visit_count"].astype(float) + cat_pool["distance_km"].map(lambda d: safe_div(5.0, max(float(d), 0.05)))
             for _, row in cat_pool.sort_values("score", ascending=False).head(self.config.category_top_n * (2 if expanded else 1)).iterrows():
-                add_candidate(str(row["POI_id"]), float(row["score"]), "category_intent")
+                add_candidate(str(row["POI_id"]), float(row["score"]), "category_intent", float(row["distance_km"]))
         trace.append(_tool_record("S3_CANDIDATES_RETRIEVED", "CategoryIntentRecall", len(cat_pool), {"categories": likely_categories}))
 
         trans_scores = self._transition_scores(context, user_rows)
@@ -700,7 +786,7 @@ class IAAAgent:
             if src == context.last_known_poi:
                 scores[dst] += count
         global_cat = self.repo.global_category_transitions()
-        catalog = self.repo.runtime_catalog()
+        catalog = self.repo.runtime_catalog(include_unvisited=True)
         by_cat = catalog.groupby("category")
         for (src, dst_cat), count in global_cat.items():
             if src == context.last_known_category and dst_cat in by_cat.groups:

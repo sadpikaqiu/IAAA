@@ -14,12 +14,21 @@ class DeepSeekClient:
         self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
         self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
         self.api_key = os.environ.get("DEEPSEEK_API_KEY")
+        self.last_usage: dict[str, int] | None = None
+        self.usage_totals: dict[str, int] = {
+            "prompt_tokens": 0,
+            "prompt_cache_hit_tokens": 0,
+            "prompt_cache_miss_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
 
     @property
     def available(self) -> bool:
         return bool(self.api_key)
 
     def chat_json(self, messages: list[dict[str, str]], max_tokens: int = 900) -> dict[str, Any] | None:
+        self.last_usage = None
         if not self.api_key:
             return None
         payload = {
@@ -27,6 +36,7 @@ class DeepSeekClient:
             "messages": messages,
             "temperature": 0,
             "max_tokens": max_tokens,
+            "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
         }
         req = urllib.request.Request(
@@ -43,6 +53,7 @@ class DeepSeekClient:
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             return None
+        self._record_usage(data.get("usage", {}))
         content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         if not content:
             return None
@@ -50,6 +61,19 @@ class DeepSeekClient:
             return json.loads(_extract_json(content))
         except json.JSONDecodeError:
             return None
+
+    def _record_usage(self, usage: dict[str, Any]) -> None:
+        fields = {
+            "prompt_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            "completion_tokens",
+            "total_tokens",
+        }
+        parsed = {field: int(usage.get(field, 0) or 0) for field in fields}
+        self.last_usage = parsed
+        for field, value in parsed.items():
+            self.usage_totals[field] = self.usage_totals.get(field, 0) + value
 
 
 def _extract_json(text: str) -> str:
@@ -70,4 +94,3 @@ def parse_intention_or_none(data: dict[str, Any] | None) -> Intention | None:
         return Intention.model_validate(data)
     except Exception:
         return None
-

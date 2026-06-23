@@ -59,6 +59,8 @@ Recommended evaluation workflow:
 
 Use `--save-runs` when you need per-session `AgentRunResult` JSON files for case study and error analysis. Use `--smoke-limit` only for quick development runs; omit it for full-dataset reporting.
 
+DeepSeek cache notes are recorded in `DEEPSEEK_CONTEXT_CACHE_NOTES.md`; an annotated successful trace is in `TRACE_ANNOTATION_USER_349_SESSION_349_67.md`.
+
 Outputs expose both IDs:
 
 - `poi_idx`: stable compact ID such as `P000123`, intended for prompts and readable traces.
