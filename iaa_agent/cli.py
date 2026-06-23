@@ -8,8 +8,7 @@ from rich.console import Console
 
 from .data import NYCDataRepository
 from .engine import IAAAgent, RunConfig
-from .evaluation import evaluate as evaluate_runs
-from .evaluation import evaluate_user_split
+from .evaluation import evaluate_session_split
 from .utils import read_json, write_json
 
 app = typer.Typer(help="IAA-Agent NYC-first CLI")
@@ -124,45 +123,31 @@ def replay(
 @app.command(name="evaluate")
 def evaluate_command(
     data_dir: str = typer.Option("datasets/NYC", help="Directory containing NYC_train/val/test.csv"),
-    limit: int = typer.Option(50, help="Number of test trajectories to evaluate; use 0 for all"),
-    out: str = typer.Option("outputs/evaluation/evaluation_results.json", help="Metrics JSON output"),
+    train_ratio: float = typer.Option(0.8, help="Per-user chronological train ratio for long-term history"),
+    min_context: int = typer.Option(1, help="Minimum visible check-ins before the session target"),
+    smoke_limit: int = typer.Option(0, help="Optional session sample cap for smoke runs; 0 evaluates the full split"),
+    out: str = typer.Option("outputs/evaluation/session_split_results.json", help="Metrics JSON output"),
     llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
 ) -> None:
     repo = NYCDataRepository(data_dir)
-    actual_limit = None if limit == 0 else limit
-    result = evaluate_runs(repo, limit=actual_limit, llm_mode=llm)
-    payload = result.as_dict()
-    write_json(out, payload)
-    console.print(f"Wrote evaluation results to {out}")
-    console.print(payload)
-
-
-@app.command("evaluate-user-split")
-def evaluate_user_split_command(
-    data_dir: str = typer.Option("datasets/NYC", help="Directory containing NYC_train/val/test.csv"),
-    limit: int = typer.Option(50, help="Number of user-test events to evaluate; use 0 for all"),
-    train_ratio: float = typer.Option(0.8, help="Per-user chronological train ratio"),
-    context_size: int = typer.Option(5, help="Number of previous check-ins used as short-term context"),
-    out: str = typer.Option("outputs/evaluation/user_split_results.json", help="Metrics JSON output"),
-    llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
-) -> None:
-    repo = NYCDataRepository(data_dir)
-    actual_limit = None if limit == 0 else limit
-    result = evaluate_user_split(
+    actual_smoke_limit = None if smoke_limit == 0 else smoke_limit
+    result = evaluate_session_split(
         repo,
-        limit=actual_limit,
         train_ratio=train_ratio,
-        context_size=context_size,
+        min_context=min_context,
+        smoke_limit=actual_smoke_limit,
         llm_mode=llm,
     )
     payload = result.as_dict()
     payload["split"] = {
-        "mode": "user_chronological",
+        "mode": "user_chronological_session",
         "train_ratio": train_ratio,
-        "context_size": context_size,
+        "min_context": min_context,
+        "session_source": "original trajectory_id",
+        "smoke_limit": smoke_limit,
     }
     write_json(out, payload)
-    console.print(f"Wrote user-split evaluation results to {out}")
+    console.print(f"Wrote evaluation results to {out}")
     console.print(payload)
 
 

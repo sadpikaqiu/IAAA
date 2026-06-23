@@ -31,40 +31,25 @@ class EvaluationResult:
         }
 
 
-def evaluate(repo: NYCDataRepository, limit: int | None = 50, llm_mode: str = "fake") -> EvaluationResult:
-    agent = IAAAgent(repo, RunConfig(llm_mode=llm_mode))
-    traj_ids = repo.iter_test_traj_ids()
-    if limit is not None:
-        traj_ids = traj_ids[:limit]
-    ranks: list[int | None] = []
-    for traj_id in traj_ids:
-        result = agent.run(traj_id)
-        gt = result.ground_truth_poi_id
-        predicted = [item.poi_id for item in result.ranked_pois]
-        rank = predicted.index(gt) + 1 if gt in predicted else None
-        ranks.append(rank)
-    return _metrics(ranks)
-
-
-def evaluate_user_split(
+def evaluate_session_split(
     repo: NYCDataRepository,
-    limit: int | None = 50,
     train_ratio: float = 0.8,
-    context_size: int = 5,
+    min_context: int = 1,
+    smoke_limit: int | None = None,
     llm_mode: str = "fake",
 ) -> EvaluationResult:
     repo.use_user_chronological_split(train_ratio)
     agent = IAAAgent(repo, RunConfig(llm_mode=llm_mode))
-    keys = repo.iter_user_test_events(train_ratio=train_ratio, min_context=1)
-    if limit is not None:
-        keys = keys[:limit]
+    keys = repo.iter_session_test_keys(train_ratio=train_ratio, min_context=min_context)
+    if smoke_limit is not None:
+        keys = keys[:smoke_limit]
     ranks: list[int | None] = []
-    for user_id, target_index in keys:
-        query = repo.get_user_query(
+    for user_id, trajectory_id in keys:
+        query = repo.get_session_query(
             user_id=user_id,
-            target_index=target_index,
+            trajectory_id=trajectory_id,
             train_ratio=train_ratio,
-            context_size=context_size,
+            min_context=min_context,
         )
         result = agent.run_query(query)
         gt = result.ground_truth_poi_id

@@ -24,19 +24,22 @@ as `missing_evidence` and must not be hallucinated in explanations.
 - `iaa-agent user-targets --user-id <user_id>`
 - `iaa-agent run-user --user-id <user_id> [--target-index <idx>] --out outputs/runs/<id>.json`
 - `iaa-agent replay --case cases/case_a.json`
-- `iaa-agent evaluate --limit 50`
-- `iaa-agent evaluate-user-split --limit 50`
+- `iaa-agent evaluate [--smoke-limit 50]`
 
 The default LLM mode is `fake`, which is deterministic and does not require
 network access. Live DeepSeek calls are enabled only with `--llm deepseek` and
 `DEEPSEEK_API_KEY` in the environment.
 
-`run --traj-id` remains available for GETNext-style session debugging. The main
-research/evaluation path is now user chronological splitting: sort each user's
-full check-in stream by time, use the first 80% as long-term history, and
-predict events in the remaining 20% with the preceding check-ins as short-term
-context. If `run-user` omits `--target-index`, it defaults to the user's last
-held-out event.
+`run --traj-id` remains available for GETNext-style session debugging. `run-user`
+is for inspecting individual event-level cases; if it omits `--target-index`,
+it defaults to the user's last held-out event.
+
+The formal evaluation path is session-level. It sorts each user's full check-in
+stream by time, uses the first 80% as long-term history, then evaluates original
+`trajectory_id` sessions whose final check-in falls in the held-out 20%. Each
+session contributes one prediction: previous check-ins in that trajectory are
+the short-term context, and the final check-in is the ground truth. `--smoke-limit`
+is only for quick development runs; full reporting should omit it.
 
 Every POI has two IDs in outputs:
 

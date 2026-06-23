@@ -6,6 +6,7 @@ from pathlib import Path
 from iaa_agent.cli import _resolve_user_target_index
 from iaa_agent.data import NYCDataRepository
 from iaa_agent.engine import IAAAgent, RunConfig
+from iaa_agent.evaluation import evaluate_session_split
 from iaa_agent.utils import haversine_km
 
 
@@ -87,3 +88,26 @@ def test_default_user_target_index_uses_last_held_out_event() -> None:
     info = repo.user_timeline_info("349", train_ratio=0.8)
     assert _resolve_user_target_index(repo, "349", 0.8, None) == info["valid_target_index_end"]
     assert _resolve_user_target_index(repo, "349", 0.8, 576) == 576
+
+
+def test_session_split_query_uses_original_trajectory() -> None:
+    repo = NYCDataRepository("datasets/NYC")
+    repo.use_user_chronological_split(0.8)
+    user_id, trajectory_id = repo.iter_session_test_keys(train_ratio=0.8, min_context=1)[0]
+    query = repo.get_session_query(user_id, trajectory_id, train_ratio=0.8, min_context=1)
+
+    assert query.mode == "session_split"
+    assert query.history is not None
+    assert query.target_index is not None
+    assert len(query.context) >= 1
+    assert query.context["trajectory_id"].nunique() == 1
+    assert str(query.context.iloc[0]["trajectory_id"]) == str(query.target["trajectory_id"])
+    assert str(query.context.iloc[-1]["UTC_time"]) != str(query.target["UTC_time"])
+
+
+def test_session_split_evaluation_smoke() -> None:
+    repo = NYCDataRepository("datasets/NYC")
+    result = evaluate_session_split(repo, smoke_limit=1, llm_mode="fake")
+    payload = result.as_dict()
+    assert payload["total"] == 1
+    assert set(payload) == {"total", "Hit@1", "Hit@5", "Hit@10", "NDCG@1", "NDCG@5", "NDCG@10", "MRR"}

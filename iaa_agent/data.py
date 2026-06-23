@@ -142,6 +142,58 @@ class NYCDataRepository:
         keys.sort(key=lambda x: (x[0], x[1]))
         return keys
 
+    def iter_session_test_keys(self, train_ratio: float = 0.8, min_context: int = 1) -> list[tuple[str, str]]:
+        keys: list[tuple[pd.Timestamp, str, str]] = []
+        for user_id, rows in self.all_events.groupby("user_id", sort=False):
+            ordered = rows.sort_values("UTC_time").reset_index(drop=True)
+            if len(ordered) <= min_context:
+                continue
+            cutoff = self._user_cutoff_index(ordered, train_ratio)
+            for trajectory_id, session in ordered.groupby("trajectory_id", sort=False):
+                session = session.sort_values("UTC_time")
+                if len(session) <= min_context:
+                    continue
+                target = session.iloc[-1]
+                target_index = int(session.index[-1])
+                if target_index < cutoff:
+                    continue
+                keys.append((pd.Timestamp(target["UTC_time"]), str(user_id), str(trajectory_id)))
+        keys.sort(key=lambda x: (x[0], x[1], _trajectory_sort_key(x[2])))
+        return [(user_id, trajectory_id) for _, user_id, trajectory_id in keys]
+
+    def get_session_query(
+        self,
+        user_id: str | int,
+        trajectory_id: str | int,
+        train_ratio: float = 0.8,
+        min_context: int = 1,
+    ) -> QueryExample:
+        user_key = str(user_id)
+        trajectory_key = str(trajectory_id)
+        rows = self.all_events[self.all_events["user_id"] == user_key].sort_values("UTC_time").reset_index(drop=True)
+        if rows.empty:
+            raise KeyError(f"Unknown user id: {user_id}")
+        cutoff = self._user_cutoff_index(rows, train_ratio)
+        session = rows[rows["trajectory_id"] == trajectory_key].sort_values("UTC_time")
+        if session.empty:
+            raise KeyError(f"Unknown trajectory id {trajectory_id} for user {user_id}")
+        if len(session) <= min_context:
+            raise ValueError(f"Trajectory {trajectory_id} has fewer than {min_context + 1} check-ins")
+        target_index = int(session.index[-1])
+        if target_index < cutoff:
+            raise ValueError(f"Trajectory {trajectory_id} target is before the held-out split cutoff {cutoff}")
+        history = rows.iloc[:cutoff].copy()
+        context = session.iloc[:-1].copy().reset_index(drop=True)
+        target = session.iloc[-1].copy()
+        return QueryExample(
+            traj_id=f"session_{trajectory_key}",
+            context=context,
+            target=target,
+            mode="session_split",
+            history=history,
+            target_index=target_index,
+        )
+
     def get_user_query(
         self,
         user_id: str | int,
@@ -207,7 +259,9 @@ class NYCDataRepository:
         base = base_history.copy() if base_history is not None else self._history_by_user.get(str(user_id), pd.DataFrame(columns=self.history.columns)).copy()
         if context is not None and len(context):
             visible = context.copy()
-            return pd.concat([base, visible], ignore_index=True).sort_values("UTC_time").reset_index(drop=True)
+            merged = pd.concat([base, visible], ignore_index=True)
+            merged = merged.drop_duplicates(["user_id", "POI_id", "UTC_time", "trajectory_id"], keep="first")
+            return merged.sort_values("UTC_time").reset_index(drop=True)
         return base.sort_values("UTC_time").reset_index(drop=True)
 
     def runtime_catalog(self, context: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -372,6 +426,14 @@ class NYCDataRepository:
         out = df.copy()
         out["POI_idx"] = out["POI_id"].map(self._poi_id_to_idx).fillna("P000000")
         return out
+
+    def _user_cutoff_index(self, rows: pd.DataFrame, train_ratio: float) -> int:
+        if not 0 < train_ratio < 1:
+            raise ValueError("train_ratio must be between 0 and 1")
+        cutoff = max(1, int(len(rows) * train_ratio))
+        if len(rows) >= 2:
+            cutoff = min(cutoff, len(rows) - 1)
+        return cutoff
 
     def _reset_history_caches(self) -> None:
         self._global_category_transitions = None
