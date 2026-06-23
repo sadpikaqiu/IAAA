@@ -1,0 +1,40 @@
+# Secrets
+API keys.txt
+.env
+.env.*
+*.key
+
+# Local data and generated artifacts
+datasets/
+outputs/
+reference/
+*.pdf
+
+# Codex/local workspace state
+.agents/
+.codex/
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

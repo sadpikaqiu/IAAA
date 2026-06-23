@@ -1,0 +1,22 @@
+[project]
+name = "iaa-agent"
+version = "0.1.0"
+description = "NYC-first Intention-Affordance Aligned Agent for next POI recommendation"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "pandas",
+  "pydantic",
+  "typer",
+  "rich",
+  "python-dotenv",
+  "scikit-learn",
+]
+
+[project.scripts]
+iaa-agent = "iaa_agent.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
