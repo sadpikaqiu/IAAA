@@ -44,6 +44,12 @@ def circular_minute_diff(a: int, b: int) -> int:
     return min(diff, 1440 - diff)
 
 
+def circular_hour_diff(a: int, b: int) -> int:
+    """两个小时(0-23)的圆周最小差,23 与 0 相差 1。"""
+    diff = abs(int(a) - int(b))
+    return min(diff, 24 - diff)
+
+
 def safe_div(num: float, den: float, default: float = 0.0) -> float:
     return default if den == 0 else num / den
 

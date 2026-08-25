@@ -28,6 +28,7 @@ from .models import (
 )
 from .utils import (
     category_family,
+    circular_hour_diff,
     circular_minute_diff,
     cosine_dict,
     entropy,
@@ -89,6 +90,13 @@ The next message contains the dynamic query data. Return JSON only.
 @dataclass
 class RunConfig:
     candidate_pool_size: int = 30
+    source_quota: int = 0
+    multi_source_weight: float = 0.0
+    global_cat_transition_weight: float = 0.0
+    cat_intent_vc_weight: float = 1.0
+    cat_intent_dist_gain: float = 5.0
+    temporal_granularity: str = "bucket"
+    soft_category_mismatch: bool = False
     spatial_top_n: int = 50
     category_top_n: int = 50
     transition_top_n: int = 30
@@ -98,12 +106,19 @@ class RunConfig:
     max_reflection_rounds: int = 1
     llm_mode: str = "fake"
 
+    @classmethod
+    def p4(cls, llm_mode: str = "fake") -> "RunConfig":
+        """P4v1 preset: soften category mismatch while leaving failed probes off."""
+        return cls(llm_mode=llm_mode, soft_category_mismatch=True)
+
 
 class IAAAgent:
     def __init__(self, repo: NYCDataRepository, config: RunConfig | None = None) -> None:
         self.repo = repo
         self.config = config or RunConfig()
         self.llm = DeepSeekClient()
+        self.last_intention_source = "not_run"
+        self.last_llm_status = "not_called"
 
     def run(self, traj_id: str) -> AgentRunResult:
         query = self.repo.get_query(traj_id)
@@ -157,6 +172,9 @@ class IAAAgent:
             f"confidence={intention.confidence:.2f}",
         ]
         intention_params = {"llm_mode": self.config.llm_mode}
+        if self.config.llm_mode == "deepseek":
+            intention_params["intention_source"] = self.last_intention_source
+            intention_params["deepseek_status"] = self.last_llm_status
         if llm_usage:
             hit = llm_usage.get("prompt_cache_hit_tokens", 0)
             miss = llm_usage.get("prompt_cache_miss_tokens", 0)
@@ -346,7 +364,13 @@ class IAAAgent:
         query: QueryExample,
     ) -> Intention:
         heuristic = self._heuristic_intention(context, profile, peers, query)
-        if self.config.llm_mode != "deepseek" or not self.llm.available:
+        self.last_intention_source = "heuristic"
+        self.last_llm_status = "not_requested"
+        if self.config.llm_mode != "deepseek":
+            return heuristic
+        if not self.llm.available:
+            self.last_intention_source = "heuristic_fallback"
+            self.last_llm_status = "missing_api_key"
             return heuristic
         stable_profile = self._stable_profile_for_llm_cache(query)
         prompt = {
@@ -366,7 +390,18 @@ class IAAAgent:
                 {"role": "user", "content": "Dynamic session query:\n" + json.dumps(prompt, ensure_ascii=False, sort_keys=True)},
             ]
         )
-        return parse_intention_or_none(data) or heuristic
+        intention = parse_intention_or_none(data)
+        if intention is not None:
+            self.last_intention_source = "deepseek"
+            self.last_llm_status = self.llm.last_call_status
+            return intention
+        self.last_intention_source = "heuristic_fallback"
+        self.last_llm_status = (
+            "invalid_intention"
+            if data is not None and self.llm.last_call_status == "success"
+            else self.llm.last_call_status
+        )
+        return heuristic
 
     def _stable_profile_for_llm_cache(self, query: QueryExample) -> dict:
         if query.history is not None and not query.history.empty:
@@ -410,6 +445,21 @@ class IAAAgent:
         for trans in profile.frequent_category_transitions[:10]:
             if trans["from_category"] == context.last_known_category:
                 scores[trans["to_category"]] += 2.0 * trans["count"]
+        # P4 意图层兜底:个人类别转移稀疏时,用全局 P(gt_cat | last_cat) 条件概率补强。
+        # 归一化为条件概率(非边际热度),避免退化成全局热门类别信号。数据实证:76% 未覆盖真值的
+        # gt 类别未进意图 top5,而 (last_cat→gt_cat) 一阶转移在训练集已知——此处把群体序列规律接入。
+        gw = self.config.global_cat_transition_weight
+        if gw > 0 and context.last_known_category:
+            global_cat = self.repo.global_category_transitions()
+            out_total = 0
+            out_targets: dict[str, int] = {}
+            for (src, dst), count in global_cat.items():
+                if src == context.last_known_category:
+                    out_targets[dst] = out_targets.get(dst, 0) + int(count)
+                    out_total += int(count)
+            if out_total > 0:
+                for dst, count in out_targets.items():
+                    scores[dst] += gw * (count / out_total)
         peer_rows = self._peer_rows_near_target(peers, pd.Timestamp(query.target["local_time"]))
         for cat, count in peer_rows["POI_catname"].value_counts().head(10).items() if not peer_rows.empty else []:
             scores[str(cat)] += 1.5 * int(count)
@@ -507,9 +557,12 @@ class IAAAgent:
         trace: list[ToolCallRecord] = []
         limit = self.config.candidate_pool_size * (3 if expanded else 2)
         spatial_top = 100 if expanded else self.config.spatial_top_n
+        # P1 性能优化:一次性构建目录查表器,避免每个候选都重建整个 runtime_catalog。
+        # 语义与逐候选调用 repo.poi_meta(poi_id, query.context) 完全一致。
+        meta_lookup = self.repo.build_meta_lookup(query.context)
 
         def add_candidate(poi_id: str, score: float, source: str, distance: float | None = None) -> None:
-            meta = self.repo.poi_meta(poi_id, query.context)
+            meta = meta_lookup.get(poi_id)
             if not meta["category"] or meta["category"] == "Unknown":
                 return
             if distance is None:
@@ -569,7 +622,12 @@ class IAAAgent:
                 )
                 for row in cat_pool.itertuples(index=False)
             ]
-            cat_pool["score"] = cat_pool["visit_count"].astype(float) + cat_pool["distance_km"].map(lambda d: safe_div(5.0, max(float(d), 0.05)))
+            # P4 召回:category_intent 选 POI 的排序键。默认 vc_weight=1.0/dist_gain=5.0 等价原式
+            # (visit_count + 5/dist)。预判实证:visit_count 量纲主导致冷门真值(类别内visit中位排名73)
+            # 被热门远点压过,cat_pool 召回率仅31%;压低 vc_weight、让距离主导可升至~52%。
+            vcw = self.config.cat_intent_vc_weight
+            dg = self.config.cat_intent_dist_gain
+            cat_pool["score"] = vcw * cat_pool["visit_count"].astype(float) + cat_pool["distance_km"].map(lambda d: safe_div(dg, max(float(d), 0.05)))
             for _, row in cat_pool.sort_values("score", ascending=False).head(self.config.category_top_n * (2 if expanded else 1)).iterrows():
                 add_candidate(str(row["POI_id"]), float(row["score"]), "category_intent", float(row["distance_km"]))
         trace.append(_tool_record("S3_CANDIDATES_RETRIEVED", "CategoryIntentRecall", len(cat_pool), {"categories": likely_categories}))
@@ -589,8 +647,10 @@ class IAAAgent:
             (self.repo.history["hour_bucket"] == target_hb)
             & (self.repo.history["day_of_week"] == context.target_day_of_week)
         ]["POI_id"].value_counts()
-        for poi_id, count in temporal.head(30 if expanded else 15).items():
+        temporal_top = temporal.head(30 if expanded else 15)
+        for poi_id, count in temporal_top.items():
             add_candidate(str(poi_id), float(count), "temporal_popularity")
+        trace.append(_tool_record("S3_CANDIDATES_RETRIEVED", "TemporalPopularityRecall", int(len(temporal_top))))
 
         candidates = self._select_candidates(raw, expanded=expanded)
         trace.append(
@@ -627,7 +687,36 @@ class IAAAgent:
             candidates.append(Candidate.model_validate(item))
         candidates.sort(key=lambda c: (c.prior_score, -c.distance_km), reverse=True)
         size = self.config.candidate_pool_size * (2 if expanded else 1)
-        return candidates[:size]
+        quota = self.config.source_quota
+        if quota <= 0:
+            # 退化为原逻辑:纯按 prior_score 全局排序截断(q=0 严格等价基线)。
+            return candidates[:size]
+        # P4 配额制:解决"真值被某召回源捞到却被高 prior 候选挤出 B"(探测实测 A_被截断 13.5%)。
+        # 每路召回源保底 quota 个名额——按"源内归一化得分"取 top-quota,强制入池;
+        # 剩余名额再按全局 prior 序填充。源遍历顺序与源内 tie-break(poi_id)均确定,守 AD-9。
+        chosen_ids: set[str] = set()
+        for source in sorted(max_by_source):
+            src_max = max_by_source[source] or 1.0
+            src_ranked = sorted(
+                (c for c in candidates if source in c.source_scores),
+                key=lambda c: (-(c.source_scores[source] / src_max), c.poi_id),
+            )
+            for c in src_ranked[:quota]:
+                chosen_ids.add(c.poi_id)
+        # 输出:配额选中者优先(仍按 prior 序保持稳定),再用全局 prior 序填满到 size。
+        result: list[Candidate] = []
+        seen: set[str] = set()
+        for c in candidates:
+            if c.poi_id in chosen_ids:
+                result.append(c)
+                seen.add(c.poi_id)
+        for c in candidates:
+            if len(result) >= size:
+                break
+            if c.poi_id not in seen:
+                result.append(c)
+                seen.add(c.poi_id)
+        return result[:size]
 
     def _build_affordances(
         self,
@@ -665,6 +754,10 @@ class IAAAgent:
             self._popularity_support(candidate, context),
             self._reachability(candidate, context),
         ]
+        # P4 第9维:多源召回共识。数据实证真值平均命中 2.0 源 vs 全候选 1.2 源(1.66x 区分度),
+        # 3+ 源命中真值中位排名第1。权重=0 时不加该维,严格等价基线;>0 时由扫描定值。
+        if self.config.multi_source_weight > 0:
+            verdicts.append(self._multi_source_consensus(candidate))
         weights = self._alignment_weights(intention, profile)
         score_decomp: dict[str, float] = {}
         for verdict in verdicts:
@@ -802,6 +895,18 @@ class IAAAgent:
         peer_ids = {uid for uid, _ in peers}
         return rows[rows["user_id"].isin(peer_ids)].copy()
 
+    def _multi_source_consensus(self, candidate: Candidate) -> AffordanceVerdict:
+        # P4 第9维:被多路召回源同时命中 = 真值富集信号(实证真值均 2.0 源 vs 全候选 1.2 源)。
+        # source_scores 来自 cutoff 前可见数据的各路召回,不含未来信息,守 AD-7。
+        nsrc = len(candidate.source_scores)
+        labels = ", ".join(sorted(candidate.source_scores)) or "none"
+        if nsrc >= 3:
+            conf = min(0.95, 0.6 + 0.1 * nsrc)
+            return _verdict("multi_source_consensus", "Candidate should be corroborated by multiple recall sources.", "yes", conf, [f"Hit by {nsrc} recall sources ({labels}); strong cross-source consensus."])
+        if nsrc == 2:
+            return _verdict("multi_source_consensus", "Candidate should be corroborated by multiple recall sources.", "uncertain", 0.6, [f"Hit by 2 recall sources ({labels}); moderate consensus."])
+        return _verdict("multi_source_consensus", "Candidate lacks multi-source corroboration.", "no", 0.5, [f"Hit by a single recall source ({labels}); no cross-source consensus."])
+
     def _category_match(self, candidate: Candidate, intention: Intention) -> AffordanceVerdict:
         weights = {x.category: x.weight for x in intention.likely_categories}
         top_families = {category_family(x.category): x.weight for x in intention.likely_categories}
@@ -811,6 +916,8 @@ class IAAAgent:
         fam = category_family(candidate.category)
         if fam in top_families:
             return _verdict("category_match", "Candidate category family should match inferred intention.", "uncertain", 0.62, [f"Candidate category family {fam} matches an inferred category family."])
+        if self.config.soft_category_mismatch:
+            return _verdict("category_match", "Candidate category lacks intention support.", "uncertain", 0.3, [f"Candidate category {candidate.category} is outside inferred intention; weak category evidence."])
         return _verdict("category_match", "Candidate category should match inferred intention.", "no", 0.75, [f"Candidate category {candidate.category} is not supported by inferred intention."])
 
     def _spatial_feasibility(self, candidate: Candidate, profile: UserProfile) -> AffordanceVerdict:
@@ -821,6 +928,8 @@ class IAAAgent:
         return _verdict("spatial_feasibility", "Candidate should be reachable from last location.", "no", 0.8, [f"Distance {candidate.distance_km:.2f} km exceeds usual movement range."])
 
     def _temporal_fit(self, candidate: Candidate, rows: pd.DataFrame, context: ContextSnapshot) -> AffordanceVerdict:
+        if self.config.temporal_granularity != "bucket":
+            return self._temporal_fit_exact(candidate, rows, context)
         target_hb = context.target_hour // 3
         user_same_cat_hour = rows[(rows["POI_catname"] == candidate.category) & (rows["hour_bucket"] == target_hb)]
         user_same_poi_hour = rows[(rows["POI_id"] == candidate.poi_id) & (rows["hour_bucket"] == target_hb)]
@@ -832,6 +941,55 @@ class IAAAgent:
         if len(global_same) > 0:
             return _verdict("temporal_fit", "POI should have historical activity near target time.", "uncertain", 0.55, [f"Global history contains {len(global_same)} same-hour-bucket visits for this POI."])
         return _verdict("temporal_fit", "POI/category should fit target time.", "uncertain", 0.35, ["No strong same-hour evidence; temporal fit is weak."])
+
+    def _temporal_fit_exact(self, candidate: Candidate, rows: pd.DataFrame, context: ContextSnapshot) -> AffordanceVerdict:
+        """精确小时圆周邻近 + 工作日/周末一致性(P4 时间粒度细化)。
+
+        相比 bucket 版(hour//3 粗档),改用数据里已有的精确 hour 与 day_of_week:
+          - 每次历史访问按 |hour差| 的圆周邻近加权(差0=1.0, 差1=0.5, 差2=0.2, 其余0)。
+          - 该次访问与目标同属工作日(或同属周末)时再 ×1.5。
+          - POI 级分 ×2.0 + 类别级分 ×1.0(沿用 bucket 版 POI 优先于类别的口径)。
+        连续分按阈值离散化到与 bucket 版语义对齐的 verdict 档位。仅在 temporal_granularity!="bucket" 时启用。
+        探针 scripts/p4_temporal_granularity_probe.py 已验证其在可救会话上提升真值同池分位 +0.0745。
+        """
+        target_hour = context.target_hour
+        target_weekend = context.target_day_of_week >= 5
+        hour_weight = {0: 1.0, 1: 0.5, 2: 0.2}
+
+        def proximity_score(subset: pd.DataFrame) -> float:
+            total = 0.0
+            for hour, dow in zip(subset["hour"], subset["day_of_week"]):
+                w = hour_weight.get(circular_hour_diff(int(hour), target_hour), 0.0)
+                if w == 0.0:
+                    continue
+                if (int(dow) >= 5) == target_weekend:
+                    w *= 1.5
+                total += w
+            return total
+
+        poi_rows = rows[rows["POI_id"] == candidate.poi_id]
+        cat_rows = rows[rows["POI_catname"] == candidate.category]
+        poi_score = proximity_score(poi_rows)
+        cat_score = proximity_score(cat_rows)
+        kind = "weekend" if target_weekend else "weekday"
+
+        # 用户在该 POI 附近时段有强契合 → 高置信 yes(对齐 bucket 版"同 POI 同桶"档)。
+        if poi_score > 0:
+            conf = min(0.92, 0.78 + 0.05 * poi_score)
+            return _verdict("temporal_fit", "POI should fit target time.", "yes", round(conf, 6),
+                            [f"User visited this POI near {target_hour}:00 on {kind} (hour-proximity score {poi_score:.2f})."])
+        # 仅类别级有契合 → 中置信 yes(对齐"同类同桶"档)。
+        if cat_score > 0:
+            conf = min(0.80, 0.62 + 0.04 * cat_score)
+            return _verdict("temporal_fit", "Category should fit target time.", "yes", round(conf, 6),
+                            [f"User visited category {candidate.category} near {target_hour}:00 on {kind} (hour-proximity score {cat_score:.2f})."])
+        # 用户无精确契合,看全局是否在精确小时邻近有活动 → uncertain(对齐"全局同桶"档)。
+        global_poi = self.repo.history[self.repo.history["POI_id"] == candidate.poi_id]
+        global_score = proximity_score(global_poi)
+        if global_score > 0:
+            return _verdict("temporal_fit", "POI should have historical activity near target time.", "uncertain", 0.55,
+                            [f"Global history shows activity for this POI near {target_hour}:00 (proximity score {global_score:.2f})."])
+        return _verdict("temporal_fit", "POI/category should fit target time.", "uncertain", 0.35, ["No strong near-hour evidence; temporal fit is weak."])
 
     def _revisit_support(self, candidate: Candidate, rows: pd.DataFrame) -> AffordanceVerdict:
         poi_count = int((rows["POI_id"] == candidate.poi_id).sum())
@@ -910,6 +1068,9 @@ class IAAAgent:
             weights["revisit_support"] += 0.04
             weights["peer_support"] -= 0.02
             weights["popularity_support"] -= 0.02
+        # P4 第9维权重:仅在开启时加入(=0 时表不含该键,归一化与基线完全一致)。
+        if self.config.multi_source_weight > 0:
+            weights["multi_source_consensus"] = self.config.multi_source_weight
         total = sum(weights.values())
         return {k: v / total for k, v in weights.items()}
 

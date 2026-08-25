@@ -40,6 +40,8 @@ python -m iaa_agent evaluate --user-id 349 --out outputs/evaluation/user_349_ses
 python -m iaa_agent evaluate --user-id 349 --save-runs outputs/eval_runs/user_349
 python -m iaa_agent evaluate
 python -m iaa_agent evaluate --smoke-limit 50
+python -m iaa_agent compare-p4 --concurrency 4
+python -m iaa_agent evaluate --llm deepseek --variant p4v1 --model deepseek-v4-flash --concurrency 8 --stall-timeout 600 --report-stratified --out outputs/evaluation/p4v1_deepseek_full_ih_ooh.json
 ```
 
 The default LLM mode is deterministic `fake`, so tests and normal smoke runs do not require network access.
@@ -59,7 +61,13 @@ Recommended evaluation workflow:
 
 Use `--save-runs` when you need per-session `AgentRunResult` JSON files for case study and error analysis. Use `--smoke-limit` only for quick development runs; omit it for full-dataset reporting.
 
-DeepSeek cache notes are recorded in `DEEPSEEK_CONTEXT_CACHE_NOTES.md`; an annotated successful trace is in `TRACE_ANNOTATION_USER_349_SESSION_349_67.md`.
+For IH/OOH evaluation, `IH` means that the target POI appears in the user's first 80% chronological long-term history; `OOH` means that it does not. The current session's short-term context does not change this label. In this single-ground-truth next-POI setting, `Acc@K` is numerically identical to `Hit@K`. `--report-stratified` computes both subsets from the same prediction ranks, so it does not trigger a second LLM pass.
+
+DeepSeek evaluation is fault-tolerant by default. A valid model response without `usage` metadata is retained and counted in `usage_missing_count`, not `fallback_count`. If intention generation genuinely fails, the session uses the deterministic heuristic intention and is recorded in `llm_anomalies`; the remaining evaluation continues. Use `--no-allow-fallback` to mark such sessions as strict violations without aborting or discarding completed work.
+
+DeepSeek cache notes are recorded in `docs/DEEPSEEK_CONTEXT_CACHE_NOTES.md`; an annotated successful trace is in `docs/TRACE_ANNOTATION_USER_349_SESSION_349_67.md`.
+
+A Chinese conference-style project report for the current P4v1 mainline is available at `docs/PROJECT_REPORT_P4V1_CN.md`.
 
 Outputs expose both IDs:
 

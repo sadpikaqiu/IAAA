@@ -15,6 +15,9 @@ class DeepSeekClient:
         self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
         self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         self.last_usage: dict[str, int] | None = None
+        self.last_raw_content: str | None = None  # 调试用:最后一次响应的原始 content
+        self.last_call_status = "not_called"
+        self.last_error_type: str | None = None
         self.usage_totals: dict[str, int] = {
             "prompt_tokens": 0,
             "prompt_cache_hit_tokens": 0,
@@ -29,16 +32,23 @@ class DeepSeekClient:
 
     def chat_json(self, messages: list[dict[str, str]], max_tokens: int = 900) -> dict[str, Any] | None:
         self.last_usage = None
+        self.last_raw_content = None
+        self.last_call_status = "not_called"
+        self.last_error_type = None
         if not self.api_key:
+            self.last_call_status = "missing_api_key"
             return None
-        payload = {
+        # DeepSeek 特有参数(temperature/thinking)仅对 deepseek 系列发送;
+        # 其他网关模型(claude/glm/gpt 等)会拒绝 temperature 或不认 thinking,故省略,只发通用参数。
+        payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": 0,
             "max_tokens": max_tokens,
-            "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
         }
+        if self.model.startswith("deepseek"):
+            payload["temperature"] = 0
+            payload["thinking"] = {"type": "disabled"}
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -49,20 +59,34 @@ class DeepSeekClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-            return None
-        self._record_usage(data.get("usage", {}))
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not content:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw_response = resp.read().decode("utf-8")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            self.last_call_status = "request_error"
+            self.last_error_type = type(exc).__name__
             return None
         try:
-            return json.loads(_extract_json(content))
-        except json.JSONDecodeError:
+            data = json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            self.last_call_status = "invalid_response_json"
+            self.last_error_type = type(exc).__name__
             return None
+        self._record_usage(data.get("usage"))
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        self.last_raw_content = content
+        if not content:
+            self.last_call_status = "empty_content"
+            return None
+        try:
+            parsed = json.loads(_extract_json(content))
+        except json.JSONDecodeError as exc:
+            self.last_call_status = "invalid_content_json"
+            self.last_error_type = type(exc).__name__
+            return None
+        self.last_call_status = "success"
+        return parsed
 
-    def _record_usage(self, usage: dict[str, Any]) -> None:
+    def _record_usage(self, usage: Any) -> None:
         fields = {
             "prompt_tokens",
             "prompt_cache_hit_tokens",
@@ -70,7 +94,15 @@ class DeepSeekClient:
             "completion_tokens",
             "total_tokens",
         }
+        if not isinstance(usage, dict) or not usage:
+            self.last_usage = None
+            return
         parsed = {field: int(usage.get(field, 0) or 0) for field in fields}
+        if parsed["total_tokens"] == 0:
+            parsed["total_tokens"] = parsed["prompt_tokens"] + parsed["completion_tokens"]
+        if not any(parsed.values()):
+            self.last_usage = None
+            return
         self.last_usage = parsed
         for field, value in parsed.items():
             self.usage_totals[field] = self.usage_totals.get(field, 0) + value

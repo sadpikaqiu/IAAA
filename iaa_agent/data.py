@@ -314,6 +314,18 @@ class NYCDataRepository:
             "visit_count": int(row.get("visit_count", 0)),
         }
 
+    def build_meta_lookup(self, context: pd.DataFrame | None = None) -> "PoiMetaLookup":
+        """构建一个可复用的 POI 元信息查表器。
+
+        语义与逐个调用 `poi_meta(poi_id, context)` **完全一致**(先查
+        runtime_catalog(context),未命中回退 _all_meta,再未命中返回 Unknown 占位),
+        但只构建一次目录索引,避免在候选循环中每个候选都重建整个目录(性能优化 P1)。
+        """
+        runtime = self.runtime_catalog(context)
+        runtime_by_id = {str(r["POI_id"]): r for _, r in runtime.iterrows()}
+        all_meta_by_id = {str(r["POI_id"]): r for _, r in self._all_meta.iterrows()}
+        return PoiMetaLookup(self, runtime_by_id, all_meta_by_id)
+
     def poi_idx(self, poi_id: str) -> str:
         return self._poi_id_to_idx.get(str(poi_id), "P000000")
 
@@ -458,6 +470,17 @@ class NYCDataRepository:
         self._peer_vectors = None
         self._peer_cells = None
 
+    def prewarm_global_structures(self) -> None:
+        """预热全局结构缓存(性能优化 P3):转移矩阵 + peer 向量。
+
+        这些是 lazy 缓存,首会话触发时各需约 11.7s / 4.5s。串行评估下首会话付一次;
+        并行评估下若不预热,每个 worker 进程会各自在首个 task 重算一遍(N 进程 × ~16s)。
+        在 split 之后、评估循环之前(或 worker initializer 内)调用一次即可消除该开销。
+        纯填充缓存,不改变任何输出。"""
+        self.global_category_transitions()
+        self.global_poi_transitions()
+        self.user_peer_inputs()
+
     def _transition_counts(self, column: str) -> dict[tuple[str, str], int]:
         counts: dict[tuple[str, str], int] = {}
         for _, group in self.history.groupby("trajectory_id", sort=False):
@@ -489,3 +512,47 @@ def _trajectory_sort_key(value: str) -> tuple[int, str]:
         return (int(value.split("_")[-1]), value)
     except Exception:
         return (10**9, value)
+
+
+class PoiMetaLookup:
+    """预构建目录索引的 POI 元信息查表器(性能优化 P1)。
+
+    `get(poi_id)` 的返回与 `NYCDataRepository.poi_meta(poi_id, context)` 逐字段一致:
+    先查 runtime(= runtime_catalog(context)),未命中回退 _all_meta,再未命中返回
+    Unknown 占位。差别仅在于目录索引只构建一次、按 poi_id 查字典 O(1),而非每次重建目录。
+    """
+
+    def __init__(
+        self,
+        repo: "NYCDataRepository",
+        runtime_by_id: dict[str, pd.Series],
+        all_meta_by_id: dict[str, pd.Series],
+    ) -> None:
+        self._repo = repo
+        self._runtime_by_id = runtime_by_id
+        self._all_meta_by_id = all_meta_by_id
+
+    def get(self, poi_id: str) -> dict:
+        key = str(poi_id)
+        row = self._runtime_by_id.get(key)
+        if row is None:
+            row = self._all_meta_by_id.get(key)
+        if row is None:
+            return {
+                "POI_id": key,
+                "POI_idx": self._repo.poi_idx(key),
+                "display_name": self._repo.poi_idx(key),
+                "category": "Unknown",
+                "latitude": 0.0,
+                "longitude": 0.0,
+                "visit_count": 0,
+            }
+        return {
+            "POI_id": str(row["POI_id"]),
+            "POI_idx": str(row.get("POI_idx", self._repo.poi_idx(str(row["POI_id"])))),
+            "display_name": str(row.get("POI_idx", self._repo.poi_idx(str(row["POI_id"])))),
+            "category": str(row["category"]),
+            "latitude": float(row["latitude"]),
+            "longitude": float(row["longitude"]),
+            "visit_count": int(row.get("visit_count", 0)),
+        }

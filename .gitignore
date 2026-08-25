@@ -8,6 +8,7 @@ API keys.txt
 datasets/
 outputs/
 reference/
+tmp/
 *.pdf
 
 # Codex/local workspace state
@@ -37,4 +38,3 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
-
