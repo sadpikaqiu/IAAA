@@ -166,6 +166,19 @@ def evaluate_command(
     ),
     model: Optional[str] = typer.Option(None, help="Live LLM model name"),
     base_url: Optional[str] = typer.Option(None, help="OpenAI-compatible API base URL"),
+    thinking: bool = typer.Option(
+        False,
+        "--thinking/--no-thinking",
+        help="Enable Qwen reasoning before the structured intention response",
+    ),
+    reasoning_effort: str = typer.Option(
+        "medium",
+        help="Qwen reasoning effort: low, medium, or xhigh",
+    ),
+    llm_max_tokens: Optional[int] = typer.Option(
+        None,
+        help="Optional live-LLM completion-token limit; thinking runs should use at least 2048",
+    ),
     report_stratified: bool = typer.Option(
         False,
         "--report-stratified",
@@ -179,9 +192,20 @@ def evaluate_command(
         raise typer.BadParameter("--concurrency must be >= 1")
     if stall_timeout < 0:
         raise typer.BadParameter("--stall-timeout must be >= 0")
+    if thinking and llm != "openai":
+        raise typer.BadParameter("--thinking is only supported with --llm openai")
+    if reasoning_effort not in {"low", "medium", "xhigh"}:
+        raise typer.BadParameter("--reasoning-effort must be low, medium, or xhigh")
+    if llm_max_tokens is not None and llm_max_tokens < 1:
+        raise typer.BadParameter("--llm-max-tokens must be >= 1")
 
     resolved_model = None
     if is_live_llm_mode(llm):
+        if llm == "openai":
+            os.environ["OPENAI_ENABLE_THINKING"] = "1" if thinking else "0"
+            os.environ["OPENAI_REASONING_EFFORT"] = reasoning_effort
+            if llm_max_tokens is not None:
+                os.environ["OPENAI_MAX_TOKENS"] = str(llm_max_tokens)
         resolved_model = _configure_live_llm(llm, model, base_url)
         _preflight_llm(llm)
 
@@ -270,6 +294,12 @@ def evaluate_command(
     payload["llm_mode"] = llm
     if resolved_model is not None:
         payload["model"] = resolved_model
+    if llm == "openai":
+        payload["thinking"] = {
+            "enabled": thinking,
+            "reasoning_effort": reasoning_effort if thinking else None,
+            "max_tokens": llm_max_tokens,
+        }
 
     if report_stratified and "stratified" not in payload:
         report = evaluate_session_split_stratified(

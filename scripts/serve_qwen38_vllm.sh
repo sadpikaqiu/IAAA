@@ -9,6 +9,7 @@ MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-16384}"
 MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-8192}"
 MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-16}"
 GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
+REASONING_PARSER="${VLLM_REASONING_PARSER:-qwen3}"
 VLLM_BIN="${VLLM_BIN:-$(command -v vllm || true)}"
 
 if [[ -z "${VLLM_BIN}" || ! -x "${VLLM_BIN}" ]]; then
@@ -35,6 +36,7 @@ exec "${VLLM_BIN}" serve "${MODEL_PATH}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --enable-prefix-caching \
   --generation-config vllm \
+  --reasoning-parser "${REASONING_PARSER}" \
   --default-chat-template-kwargs.enable_thinking false \
   --default-chat-template-kwargs.preserve_thinking false \
   --language-model-only \

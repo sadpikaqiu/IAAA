@@ -36,6 +36,7 @@ class DeepSeekClient:
             self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         self.last_usage: dict[str, int] | None = None
         self.last_raw_content: str | None = None  # 调试用:最后一次响应的原始 content
+        self.last_reasoning_content: str | None = None
         self.last_call_status = "not_called"
         self.last_error_type: str | None = None
         self.usage_totals: dict[str, int] = {
@@ -53,6 +54,7 @@ class DeepSeekClient:
     def chat_json(self, messages: list[dict[str, str]], max_tokens: int = 900) -> dict[str, Any] | None:
         self.last_usage = None
         self.last_raw_content = None
+        self.last_reasoning_content = None
         self.last_call_status = "not_called"
         self.last_error_type = None
         if not self.api_key:
@@ -68,14 +70,23 @@ class DeepSeekClient:
             payload["temperature"] = 0
             payload["thinking"] = {"type": "disabled"}
         elif self.model.lower().startswith("qwen"):
-            # IAA-Agent only needs compact structured intention JSON. Disabling
-            # reasoning avoids hidden-token overhead and JSON wrapped in think blocks.
+            enable_thinking = _env_bool("OPENAI_ENABLE_THINKING", False)
+            reasoning_effort = os.environ.get("OPENAI_REASONING_EFFORT", "medium")
+            if reasoning_effort not in {"low", "medium", "xhigh"}:
+                raise ValueError(
+                    "OPENAI_REASONING_EFFORT must be low, medium, or xhigh"
+                )
             payload["temperature"] = float(os.environ.get("OPENAI_TEMPERATURE", "0"))
             payload["seed"] = int(os.environ.get("OPENAI_SEED", "42"))
+            payload["max_tokens"] = int(
+                os.environ.get("OPENAI_MAX_TOKENS", str(max_tokens))
+            )
             payload["chat_template_kwargs"] = {
-                "enable_thinking": False,
+                "enable_thinking": enable_thinking,
                 "preserve_thinking": False,
             }
+            if enable_thinking:
+                payload["chat_template_kwargs"]["reasoning_effort"] = reasoning_effort
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -99,8 +110,10 @@ class DeepSeekClient:
             self.last_error_type = type(exc).__name__
             return None
         self._record_usage(data.get("usage"))
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "")
         self.last_raw_content = content
+        self.last_reasoning_content = message.get("reasoning_content")
         if not content:
             self.last_call_status = "empty_content"
             return None
@@ -144,6 +157,13 @@ def _extract_json(text: str) -> str:
     if start >= 0 and end > start:
         return cleaned[start : end + 1]
     return cleaned
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def parse_intention_or_none(data: dict[str, Any] | None) -> Intention | None:

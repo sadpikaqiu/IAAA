@@ -470,6 +470,53 @@ def test_openai_qwen_client_sends_non_thinking_json_request(monkeypatch) -> None
     assert client.last_usage["total_tokens"] == 13
 
 
+def test_openai_qwen_client_can_enable_reasoning(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            response = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"ok": true}',
+                            "reasoning_content": "brief private reasoning",
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
+            }
+            return json.dumps(response).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return Response()
+
+    monkeypatch.setenv("OPENAI_MODEL", "Qwen/Qwen3.8-27B-FP8")
+    monkeypatch.setenv("OPENAI_ENABLE_THINKING", "1")
+    monkeypatch.setenv("OPENAI_REASONING_EFFORT", "low")
+    monkeypatch.setenv("OPENAI_MAX_TOKENS", "2048")
+    monkeypatch.setattr("iaa_agent.llm.urllib.request.urlopen", fake_urlopen)
+
+    client = DeepSeekClient(provider="openai")
+    result = client.chat_json([{"role": "user", "content": "Return JSON."}])
+
+    assert result == {"ok": True}
+    assert captured["payload"]["max_tokens"] == 2048
+    assert captured["payload"]["chat_template_kwargs"] == {
+        "enable_thinking": True,
+        "preserve_thinking": False,
+        "reasoning_effort": "low",
+    }
+    assert client.last_reasoning_content == "brief private reasoning"
+
+
 def test_openai_mode_uses_live_llm_evaluation_path(monkeypatch) -> None:
     intention_payload = {
         "summary": "local qwen intention",

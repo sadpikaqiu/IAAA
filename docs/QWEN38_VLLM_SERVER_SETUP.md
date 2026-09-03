@@ -69,7 +69,8 @@ VLLM_GPU_MEMORY_UTILIZATION=0.90 VLLM_MAX_NUM_SEQS=32 \
 
 脚本默认设置 `VLLM_USE_FLASHINFER_SAMPLER=0`。当前服务器没有 CUDA Toolkit
 中的 `nvcc`，关闭该采样器可避免 FlashInfer 首次 JIT 编译失败；模型 FP8
-矩阵乘仍使用 CUTLASS 内核。
+矩阵乘仍使用 CUTLASS 内核。服务同时启用 `--reasoning-parser qwen3`，非思考
+请求不受影响，思考请求的 `reasoning_content` 与最终 JSON 会被分开返回。
 
 ## 4. 服务检查
 
@@ -123,7 +124,31 @@ python -m iaa_agent evaluate \
 进行全量评估。客户端 concurrency 控制并行 HTTP 请求数，实际吞吐还取决于
 vLLM batching、prompt 长度以及 GPU 上是否存在其他任务。
 
-## 6. 验收标准
+## 6. 思考模式对照实验
+
+思考模式必须显式开启，并为推理过程预留更大的 completion budget：
+
+```bash
+python -m iaa_agent evaluate \
+  --data-dir datasets/NYC \
+  --smoke-limit 50 \
+  --llm openai \
+  --variant p4v1 \
+  --model Qwen/Qwen3.8-27B-FP8 \
+  --base-url http://127.0.0.1:8000/v1 \
+  --thinking \
+  --reasoning-effort medium \
+  --llm-max-tokens 2048 \
+  --concurrency 8 \
+  --no-allow-fallback \
+  --report-stratified \
+  --out outputs/evaluation/qwen38_thinking_smoke50.json
+```
+
+先比较 50-session 的 JSON 成功率、平均 completion tokens、吞吐和推荐指标，
+再决定是否运行全量思考版。`xhigh` 可能显著增加延迟，初始对照推荐 `medium`。
+
+## 7. 验收标准
 
 1. `setup_qwen38_vllm.sh` 完成后 `pip check` 和 CUDA import 均通过。
 2. `/health` 返回 HTTP 200，`/v1/models` 包含预期模型名。
