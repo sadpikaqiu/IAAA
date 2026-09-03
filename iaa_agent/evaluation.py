@@ -73,14 +73,22 @@ class EvaluationResult:
 def _llm_run_outcome(
     agent: IAAAgent,
     config: RunConfig,
-) -> tuple[dict[str, int] | None, bool, bool, str, str]:
+) -> tuple[dict[str, int] | None, bool, bool, str, str, str | None, str | None]:
     if not is_live_llm_mode(config.llm_mode):
-        return None, False, False, "not_requested", "heuristic"
+        return None, False, False, "not_requested", "heuristic", None, None
     usage = agent.llm.last_usage
     fallback = agent.last_intention_source == "heuristic_fallback"
     usage_missing = not bool(usage and usage.get("total_tokens"))
     status = agent.last_llm_status or "unknown"
-    return usage, fallback, usage_missing, status, agent.last_intention_source
+    return (
+        usage,
+        fallback,
+        usage_missing,
+        status,
+        agent.last_intention_source,
+        agent.llm.last_error_type,
+        agent.llm.last_finish_reason,
+    )
 
 
 def evaluate_session_split(
@@ -155,10 +163,15 @@ def evaluate_session_split(
         ranks.append(rank)
         if report_stratified:
             labels.append(_session_strata_labels(query, gt))
-        llm_usage, fallback, usage_missing, llm_status, intention_source = _llm_run_outcome(
-            agent,
-            config,
-        )
+        (
+            llm_usage,
+            fallback,
+            usage_missing,
+            llm_status,
+            intention_source,
+            error_type,
+            finish_reason,
+        ) = _llm_run_outcome(agent, config)
         if is_live_llm_mode(config.llm_mode):
             llm_status_counts[llm_status] += 1
         if fallback:
@@ -171,6 +184,8 @@ def evaluate_session_split(
                     "user_id": str(user_id),
                     "trajectory_id": str(trajectory_id),
                     "status": llm_status,
+                    "error_type": error_type,
+                    "finish_reason": finish_reason,
                     "intention_source": intention_source,
                     "usage_missing": usage_missing,
                     "heuristic_fallback": fallback,
@@ -286,10 +301,15 @@ def evaluate_session_split_threaded(
                 predicted = [item.poi_id for item in result.ranked_pois]
                 rank = predicted.index(gt) + 1 if gt in predicted else None
                 label = _session_strata_labels(query, gt) if report_stratified else None
-                usage, fallback, usage_missing, llm_status, intention_source = _llm_run_outcome(
-                    agent,
-                    config,
-                )
+                (
+                    usage,
+                    fallback,
+                    usage_missing,
+                    llm_status,
+                    intention_source,
+                    error_type,
+                    finish_reason,
+                ) = _llm_run_outcome(agent, config)
                 result_queue.put(
                     (
                         "ok",
@@ -302,6 +322,8 @@ def evaluate_session_split_threaded(
                             usage_missing,
                             llm_status,
                             intention_source,
+                            error_type,
+                            finish_reason,
                             uid,
                             tid,
                         ),
@@ -346,6 +368,8 @@ def evaluate_session_split_threaded(
                 usage_missing,
                 llm_status,
                 intention_source,
+                error_type,
+                finish_reason,
                 uid,
                 tid,
             ) = payload  # type: ignore[misc]
@@ -363,6 +387,8 @@ def evaluate_session_split_threaded(
                         "user_id": str(uid),
                         "trajectory_id": str(tid),
                         "status": str(llm_status),
+                        "error_type": error_type,
+                        "finish_reason": finish_reason,
                         "intention_source": str(intention_source),
                         "usage_missing": bool(usage_missing),
                         "heuristic_fallback": bool(fallback),

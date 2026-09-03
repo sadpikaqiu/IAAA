@@ -22,6 +22,7 @@ class DeepSeekClient:
         model: str | None = None,
         base_url: str | None = None,
         provider: str = "deepseek",
+        timeout_seconds: float | None = None,
     ) -> None:
         if provider not in {"deepseek", "openai"}:
             raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -34,6 +35,22 @@ class DeepSeekClient:
             self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
             self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
             self.api_key = os.environ.get("DEEPSEEK_API_KEY")
+        timeout_env = (
+            "OPENAI_TIMEOUT_SECONDS"
+            if provider == "openai"
+            else "DEEPSEEK_TIMEOUT_SECONDS"
+        )
+        raw_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else os.environ.get(timeout_env, "120")
+        )
+        try:
+            self.timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{timeout_env} must be a positive number") from exc
+        if self.timeout_seconds <= 0:
+            raise ValueError(f"{timeout_env} must be a positive number")
         self.last_usage: dict[str, int] | None = None
         self.last_raw_content: str | None = None  # 调试用:最后一次响应的原始 content
         self.last_reasoning_content: str | None = None
@@ -104,7 +121,7 @@ class DeepSeekClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
                 raw_response = resp.read().decode("utf-8")
         except (urllib.error.URLError, TimeoutError) as exc:
             self.last_call_status = "request_error"

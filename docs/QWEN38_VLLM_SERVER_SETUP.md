@@ -139,6 +139,7 @@ python -m iaa_agent evaluate \
   --thinking \
   --reasoning-effort medium \
   --llm-max-tokens 4096 \
+  --request-timeout 600 \
   --concurrency 8 \
   --no-allow-fallback \
   --report-stratified \

@@ -160,6 +160,10 @@ def evaluate_command(
         600,
         help="Abort if no live-LLM session finishes for this many seconds; 0 disables",
     ),
+    request_timeout: Optional[int] = typer.Option(
+        None,
+        help="Per-request HTTP timeout in seconds; defaults to 600 with --thinking and 120 otherwise",
+    ),
     allow_fallback: bool = typer.Option(
         True,
         help="Allow heuristic fallback sessions; --no-allow-fallback marks them as strict violations without aborting",
@@ -192,6 +196,8 @@ def evaluate_command(
         raise typer.BadParameter("--concurrency must be >= 1")
     if stall_timeout < 0:
         raise typer.BadParameter("--stall-timeout must be >= 0")
+    if request_timeout is not None and request_timeout < 1:
+        raise typer.BadParameter("--request-timeout must be >= 1")
     if thinking and llm != "openai":
         raise typer.BadParameter("--thinking is only supported with --llm openai")
     if reasoning_effort not in {"low", "medium", "xhigh"}:
@@ -200,7 +206,15 @@ def evaluate_command(
         raise typer.BadParameter("--llm-max-tokens must be >= 1")
 
     resolved_model = None
+    resolved_request_timeout = None
     if is_live_llm_mode(llm):
+        resolved_request_timeout = request_timeout or (600 if thinking else 120)
+        timeout_env = (
+            "OPENAI_TIMEOUT_SECONDS"
+            if llm == "openai"
+            else "DEEPSEEK_TIMEOUT_SECONDS"
+        )
+        os.environ[timeout_env] = str(resolved_request_timeout)
         if llm == "openai":
             os.environ["OPENAI_ENABLE_THINKING"] = "1" if thinking else "0"
             os.environ["OPENAI_REASONING_EFFORT"] = reasoning_effort
@@ -230,7 +244,8 @@ def evaluate_command(
                 keys = keys[:actual_smoke_limit]
             console.print(
                 f"Evaluating {len(keys)} held-out sessions with {variant} {llm}; "
-                f"concurrency={concurrency}; stall-timeout={stall_timeout}s."
+                f"concurrency={concurrency}; request-timeout={resolved_request_timeout}s; "
+                f"stall-timeout={stall_timeout}s."
             )
             with Progress(
                 SpinnerColumn(),
@@ -283,6 +298,7 @@ def evaluate_command(
         "smoke_limit": smoke_limit,
         "workers": actual_workers,
         "concurrency": concurrency if is_live_llm_mode(llm) else None,
+        "request_timeout_seconds": resolved_request_timeout,
         "stall_timeout_seconds": stall_timeout if is_live_llm_mode(llm) else None,
         "strict_llm": is_live_llm_mode(llm) and not allow_fallback,
         "history_status_definition": (

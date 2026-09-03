@@ -406,6 +406,7 @@ def test_deepseek_heuristic_fallback_is_recorded_without_aborting(monkeypatch) -
     def request_failure(self, messages, max_tokens=900):
         self.last_usage = None
         self.last_call_status = "request_error"
+        self.last_error_type = "TimeoutError"
         return None
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
@@ -428,6 +429,7 @@ def test_deepseek_heuristic_fallback_is_recorded_without_aborting(monkeypatch) -
     assert result["all_sessions_used_deepseek"] is False
     assert result["llm_anomalies"][0]["heuristic_fallback"] is True
     assert result["llm_anomalies"][0]["strict_violation"] is True
+    assert result["llm_anomalies"][0]["error_type"] == "TimeoutError"
 
 
 def test_openai_qwen_client_sends_non_thinking_json_request(monkeypatch) -> None:
@@ -450,6 +452,7 @@ def test_openai_qwen_client_sends_non_thinking_json_request(monkeypatch) -> None
     def fake_urlopen(request, timeout):
         captured["url"] = request.full_url
         captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
         return Response()
 
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
@@ -467,6 +470,7 @@ def test_openai_qwen_client_sends_non_thinking_json_request(monkeypatch) -> None
         "preserve_thinking": False,
     }
     assert captured["payload"]["seed"] == 42
+    assert captured["timeout"] == 120
     assert client.last_usage["total_tokens"] == 13
 
 
@@ -502,12 +506,14 @@ def test_openai_qwen_client_can_enable_reasoning(monkeypatch) -> None:
 
     def fake_urlopen(request, timeout):
         captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
         return Response()
 
     monkeypatch.setenv("OPENAI_MODEL", "Qwen/Qwen3.8-27B-FP8")
     monkeypatch.setenv("OPENAI_ENABLE_THINKING", "1")
     monkeypatch.setenv("OPENAI_REASONING_EFFORT", "low")
     monkeypatch.setenv("OPENAI_MAX_TOKENS", "4096")
+    monkeypatch.setenv("OPENAI_TIMEOUT_SECONDS", "600")
     monkeypatch.setattr("iaa_agent.llm.urllib.request.urlopen", fake_urlopen)
 
     client = DeepSeekClient(provider="openai")
@@ -524,6 +530,7 @@ def test_openai_qwen_client_can_enable_reasoning(monkeypatch) -> None:
     assert client.last_reasoning_content == "brief private reasoning"
     assert client.last_finish_reason == "stop"
     assert client.last_usage["reasoning_tokens"] == 5
+    assert captured["timeout"] == 600
 
 
 def test_openai_mode_uses_live_llm_evaluation_path(monkeypatch) -> None:
