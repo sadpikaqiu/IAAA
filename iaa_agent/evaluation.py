@@ -14,6 +14,7 @@ from queue import Empty, Queue
 
 from .data import NYCDataRepository
 from .engine import IAAAgent, RunConfig
+from .llm import is_live_llm_mode
 from .utils import write_json
 
 
@@ -33,6 +34,7 @@ class EvaluationResult:
     usage_missing_count: int | None = None
     llm_status_counts: dict[str, int] | None = None
     llm_anomalies: list[dict] | None = None
+    all_sessions_used_llm: bool | None = None
     all_sessions_used_deepseek: bool | None = None
     stratified_report: dict | None = None
 
@@ -59,6 +61,8 @@ class EvaluationResult:
             payload["llm_status_counts"] = self.llm_status_counts
         if self.llm_anomalies is not None:
             payload["llm_anomalies"] = self.llm_anomalies
+        if self.all_sessions_used_llm is not None:
+            payload["all_sessions_used_llm"] = self.all_sessions_used_llm
         if self.all_sessions_used_deepseek is not None:
             payload["all_sessions_used_deepseek"] = self.all_sessions_used_deepseek
         if self.stratified_report is not None:
@@ -66,11 +70,11 @@ class EvaluationResult:
         return payload
 
 
-def _deepseek_run_outcome(
+def _llm_run_outcome(
     agent: IAAAgent,
     config: RunConfig,
 ) -> tuple[dict[str, int] | None, bool, bool, str, str]:
-    if config.llm_mode != "deepseek":
+    if not is_live_llm_mode(config.llm_mode):
         return None, False, False, "not_requested", "heuristic"
     usage = agent.llm.last_usage
     fallback = agent.last_intention_source == "heuristic_fallback"
@@ -106,7 +110,7 @@ def evaluate_session_split(
 
     # 并行路径(P2):仅在 workers>1、纯指标(不保存 trace)、fake 模式下启用。
     # save_runs 需 pickle 大体量的 AgentRunResult,且当前用途是快速指标基线 → 回退串行。
-    # deepseek 模式涉及网络与 token 计费,不并行以免放大不确定性 → 回退串行。
+    # Live LLM modes use the dedicated threaded evaluation path.
     use_parallel = (
         workers
         and workers > 1
@@ -151,11 +155,11 @@ def evaluate_session_split(
         ranks.append(rank)
         if report_stratified:
             labels.append(_session_strata_labels(query, gt))
-        deepseek_usage, fallback, usage_missing, llm_status, intention_source = _deepseek_run_outcome(
+        llm_usage, fallback, usage_missing, llm_status, intention_source = _llm_run_outcome(
             agent,
             config,
         )
-        if config.llm_mode == "deepseek":
+        if is_live_llm_mode(config.llm_mode):
             llm_status_counts[llm_status] += 1
         if fallback:
             fallback_count += 1
@@ -186,7 +190,8 @@ def evaluate_session_split(
                     "ground_truth_poi_idx": result.ground_truth_poi_idx,
                     "top1_poi_id": result.ranked_pois[0].poi_id if result.ranked_pois else None,
                     "top1_poi_idx": result.ranked_pois[0].poi_idx if result.ranked_pois else None,
-                    "deepseek_usage": deepseek_usage,
+                    "llm_usage": llm_usage,
+                    "deepseek_usage": llm_usage if config.llm_mode == "deepseek" else None,
                     "trace_path": str(trace_path),
                 }
             )
@@ -196,7 +201,7 @@ def evaluate_session_split(
     metrics.run_records = run_records
     if any(agent.llm.usage_totals.values()):
         metrics.llm_usage = agent.llm.usage_totals
-    if config.llm_mode == "deepseek":
+    if is_live_llm_mode(config.llm_mode):
         metrics.fallback_count = fallback_count
         metrics.usage_missing_count = usage_missing_count
         metrics.llm_status_counts = dict(llm_status_counts)
@@ -204,7 +209,9 @@ def evaluate_session_split(
             llm_anomalies,
             key=lambda item: (item["user_id"], item["trajectory_id"]),
         )
-        metrics.all_sessions_used_deepseek = fallback_count == 0
+        metrics.all_sessions_used_llm = fallback_count == 0
+        if config.llm_mode == "deepseek":
+            metrics.all_sessions_used_deepseek = fallback_count == 0
     if report_stratified:
         metrics.stratified_report = build_stratified_report(ranks, labels)
     return metrics
@@ -279,7 +286,7 @@ def evaluate_session_split_threaded(
                 predicted = [item.poi_id for item in result.ranked_pois]
                 rank = predicted.index(gt) + 1 if gt in predicted else None
                 label = _session_strata_labels(query, gt) if report_stratified else None
-                usage, fallback, usage_missing, llm_status, intention_source = _deepseek_run_outcome(
+                usage, fallback, usage_missing, llm_status, intention_source = _llm_run_outcome(
                     agent,
                     config,
                 )
@@ -344,7 +351,7 @@ def evaluate_session_split_threaded(
             ) = payload  # type: ignore[misc]
             ranks[int(index)] = rank  # type: ignore[arg-type]
             labels[int(index)] = label  # type: ignore[assignment]
-            if config.llm_mode == "deepseek":
+            if is_live_llm_mode(config.llm_mode):
                 llm_status_counts[str(llm_status)] += 1
             if fallback:
                 fallback_count += 1
@@ -377,14 +384,16 @@ def evaluate_session_split_threaded(
     metrics.fallback_count = fallback_count
     if usage_totals:
         metrics.llm_usage = dict(usage_totals)
-    if config.llm_mode == "deepseek":
+    if is_live_llm_mode(config.llm_mode):
         metrics.usage_missing_count = usage_missing_count
         metrics.llm_status_counts = dict(llm_status_counts)
         metrics.llm_anomalies = sorted(
             llm_anomalies,
             key=lambda item: (item["user_id"], item["trajectory_id"]),
         )
-        metrics.all_sessions_used_deepseek = fallback_count == 0
+        metrics.all_sessions_used_llm = fallback_count == 0
+        if config.llm_mode == "deepseek":
+            metrics.all_sessions_used_deepseek = fallback_count == 0
     if report_stratified:
         if any(label is None for label in labels):
             raise RuntimeError("Missing stratification labels after threaded evaluation")

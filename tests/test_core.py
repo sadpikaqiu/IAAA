@@ -428,3 +428,84 @@ def test_deepseek_heuristic_fallback_is_recorded_without_aborting(monkeypatch) -
     assert result["all_sessions_used_deepseek"] is False
     assert result["llm_anomalies"][0]["heuristic_fallback"] is True
     assert result["llm_anomalies"][0]["strict_violation"] is True
+
+
+def test_openai_qwen_client_sends_non_thinking_json_request(monkeypatch) -> None:
+    captured: dict = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self) -> bytes:
+            response = {
+                "choices": [{"message": {"content": '{"ok": true}'}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+            }
+            return json.dumps(response).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return Response()
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("OPENAI_MODEL", "Qwen/Qwen3.8-27B-FP8")
+    monkeypatch.setattr("iaa_agent.llm.urllib.request.urlopen", fake_urlopen)
+
+    client = DeepSeekClient(provider="openai")
+    result = client.chat_json([{"role": "user", "content": "Return JSON."}])
+
+    assert result == {"ok": True}
+    assert captured["url"] == "http://127.0.0.1:8000/v1/chat/completions"
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+    assert captured["payload"]["chat_template_kwargs"] == {
+        "enable_thinking": False,
+        "preserve_thinking": False,
+    }
+    assert captured["payload"]["seed"] == 42
+    assert client.last_usage["total_tokens"] == 13
+
+
+def test_openai_mode_uses_live_llm_evaluation_path(monkeypatch) -> None:
+    intention_payload = {
+        "summary": "local qwen intention",
+        "activity_goal": "test",
+        "likely_categories": [
+            {"category": "Coffee Shop", "weight": 1.0, "evidence": "test"}
+        ],
+        "spatial_preference": {},
+        "temporal_preference": {},
+        "behavioral_preference": {},
+        "confidence": 0.8,
+        "evidence": [],
+        "uncertainty_reasons": [],
+    }
+
+    def local_success(self, messages, max_tokens=900):
+        self.last_usage = {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}
+        self.last_call_status = "success"
+        return intention_payload
+
+    monkeypatch.setenv("OPENAI_MODEL", "Qwen/Qwen3.8-27B-FP8")
+    monkeypatch.setattr(DeepSeekClient, "chat_json", local_success)
+    repo = NYCDataRepository("datasets/NYC")
+    keys = repo.iter_session_test_keys(train_ratio=0.8, min_context=1, user_id="1")[:1]
+
+    result = evaluate_session_split_threaded(
+        repo,
+        llm_mode="openai",
+        run_config=RunConfig.p4(llm_mode="openai"),
+        session_keys=keys,
+        concurrency=1,
+    ).as_dict()
+
+    assert result["total"] == 1
+    assert result["fallback_count"] == 0
+    assert result["usage_missing_count"] == 0
+    assert result["llm_status_counts"] == {"success": 1}
+    assert result["all_sessions_used_llm"] is True
+    assert "all_sessions_used_deepseek" not in result

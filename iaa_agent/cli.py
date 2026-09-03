@@ -25,7 +25,7 @@ from .evaluation import (
     resolve_worker_count,
     stable_fractional_sample,
 )
-from .llm import DeepSeekClient
+from .llm import DeepSeekClient, is_live_llm_mode
 from .utils import read_json, write_json
 
 app = typer.Typer(help="IAA-Agent NYC-first CLI")
@@ -49,8 +49,9 @@ def run(
     traj_id: str = typer.Option(..., help="Test trajectory id, e.g. 349_52"),
     data_dir: str = typer.Option("datasets/NYC", help="Directory containing NYC_train/val/test.csv"),
     out: Optional[str] = typer.Option(None, help="JSON output path"),
-    llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
+    llm: str = typer.Option("fake", help="LLM mode: fake, deepseek, or openai"),
 ) -> None:
+    _validate_llm_mode(llm)
     repo = NYCDataRepository(data_dir)
     agent = IAAAgent(repo, RunConfig(llm_mode=llm))
     result = agent.run(traj_id)
@@ -90,8 +91,9 @@ def run_user(
     train_ratio: float = typer.Option(0.8, help="Per-user chronological train ratio"),
     context_size: int = typer.Option(5, help="Number of previous check-ins used as short-term context"),
     out: Optional[str] = typer.Option(None, help="JSON output path"),
-    llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
+    llm: str = typer.Option("fake", help="LLM mode: fake, deepseek, or openai"),
 ) -> None:
+    _validate_llm_mode(llm)
     repo = NYCDataRepository(data_dir)
     repo.use_user_chronological_split(train_ratio)
     try:
@@ -124,8 +126,9 @@ def run_user(
 def replay(
     case: str = typer.Option(..., help="Replay case JSON path"),
     out: Optional[str] = typer.Option(None, help="JSON output path"),
-    llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
+    llm: str = typer.Option("fake", help="LLM mode: fake, deepseek, or openai"),
 ) -> None:
+    _validate_llm_mode(llm)
     data = read_json(case)
     data_dir = data.get("data_dir", "datasets/NYC")
     traj_id = str(data["traj_id"])
@@ -146,31 +149,30 @@ def evaluate_command(
     smoke_limit: int = typer.Option(0, help="Optional session sample cap for smoke runs; 0 evaluates the full split"),
     save_runs: Optional[str] = typer.Option(None, help="Optional directory for per-session full AgentRunResult traces"),
     out: str = typer.Option("outputs/evaluation/session_split_results.json", help="Metrics JSON output"),
-    llm: str = typer.Option("fake", help="LLM mode: fake or deepseek"),
+    llm: str = typer.Option("fake", help="LLM mode: fake, deepseek, or openai"),
     variant: str = typer.Option("mainline", help="Ranking variant: mainline or p4v1"),
     workers: int = typer.Option(
         1,
         help="并行进程数(仅 fake 模式且不保存 trace 时生效);1=串行,0=自动取 CPU 核数",
     ),
-    concurrency: int = typer.Option(4, help="Thread concurrency for DeepSeek I/O"),
+    concurrency: int = typer.Option(4, help="Thread concurrency for live LLM I/O"),
     stall_timeout: int = typer.Option(
         600,
-        help="Abort if no DeepSeek session finishes for this many seconds; 0 disables",
+        help="Abort if no live-LLM session finishes for this many seconds; 0 disables",
     ),
     allow_fallback: bool = typer.Option(
         True,
         help="Allow heuristic fallback sessions; --no-allow-fallback marks them as strict violations without aborting",
     ),
-    model: str = typer.Option("deepseek-v4-flash", help="DeepSeek model name"),
-    base_url: Optional[str] = typer.Option(None, help="Optional DeepSeek-compatible base URL"),
+    model: Optional[str] = typer.Option(None, help="Live LLM model name"),
+    base_url: Optional[str] = typer.Option(None, help="OpenAI-compatible API base URL"),
     report_stratified: bool = typer.Option(
         False,
         "--report-stratified",
         help="Report IH/OOH, cold-start, and context-length metrics from the same predictions.",
     ),
 ) -> None:
-    if llm not in {"fake", "deepseek"}:
-        raise typer.BadParameter("--llm must be fake or deepseek")
+    _validate_llm_mode(llm)
     if variant not in {"mainline", "p4v1"}:
         raise typer.BadParameter("--variant must be mainline or p4v1")
     if concurrency < 1:
@@ -178,11 +180,10 @@ def evaluate_command(
     if stall_timeout < 0:
         raise typer.BadParameter("--stall-timeout must be >= 0")
 
-    if llm == "deepseek":
-        os.environ["DEEPSEEK_MODEL"] = model
-        if base_url:
-            os.environ["DEEPSEEK_BASE_URL"] = base_url
-        _preflight_deepseek()
+    resolved_model = None
+    if is_live_llm_mode(llm):
+        resolved_model = _configure_live_llm(llm, model, base_url)
+        _preflight_llm(llm)
 
     repo = NYCDataRepository(data_dir)
     actual_smoke_limit = None if smoke_limit == 0 else smoke_limit
@@ -194,7 +195,7 @@ def evaluate_command(
         actual_workers = 1
 
     try:
-        if llm == "deepseek" and save_runs is None:
+        if is_live_llm_mode(llm) and save_runs is None:
             repo.use_user_chronological_split(train_ratio)
             keys = repo.iter_session_test_keys(
                 train_ratio=train_ratio,
@@ -230,7 +231,7 @@ def evaluate_command(
                     progress_callback=lambda: progress.advance(task),
                     report_stratified=report_stratified,
                 )
-            _report_deepseek_quality(variant, result.as_dict())
+            _report_llm_quality(variant, result.as_dict())
         else:
             result = evaluate_session_split(
                 repo,
@@ -242,7 +243,7 @@ def evaluate_command(
                 llm_mode=llm,
                 workers=actual_workers,
                 run_config=config,
-                strict_llm=llm == "deepseek" and not allow_fallback,
+                strict_llm=is_live_llm_mode(llm) and not allow_fallback,
                 report_stratified=report_stratified and actual_workers == 1,
             )
     except (KeyError, ValueError) as exc:
@@ -257,9 +258,9 @@ def evaluate_command(
         "session_source": "original trajectory_id",
         "smoke_limit": smoke_limit,
         "workers": actual_workers,
-        "concurrency": concurrency if llm == "deepseek" else None,
-        "stall_timeout_seconds": stall_timeout if llm == "deepseek" else None,
-        "strict_llm": llm == "deepseek" and not allow_fallback,
+        "concurrency": concurrency if is_live_llm_mode(llm) else None,
+        "stall_timeout_seconds": stall_timeout if is_live_llm_mode(llm) else None,
+        "strict_llm": is_live_llm_mode(llm) and not allow_fallback,
         "history_status_definition": (
             "IH if the target POI appears in the user's first train_ratio events; "
             "OOH otherwise. Current-session context does not change this label."
@@ -267,8 +268,8 @@ def evaluate_command(
     }
     payload["variant"] = variant
     payload["llm_mode"] = llm
-    if llm == "deepseek":
-        payload["model"] = model
+    if resolved_model is not None:
+        payload["model"] = resolved_model
 
     if report_stratified and "stratified" not in payload:
         report = evaluate_session_split_stratified(
@@ -352,7 +353,7 @@ def compare_p4_command(
             stall_timeout_seconds=stall_timeout,
             progress_callback=lambda: progress.advance(baseline_task),
         )
-        _report_deepseek_quality("baseline", baseline.as_dict())
+        _report_llm_quality("baseline", baseline.as_dict())
 
         p4_task = progress.add_task("p4v1 deepseek", total=len(sample_keys))
         p4 = evaluate_session_split_threaded(
@@ -367,7 +368,7 @@ def compare_p4_command(
             stall_timeout_seconds=stall_timeout,
             progress_callback=lambda: progress.advance(p4_task),
         )
-        _report_deepseek_quality("p4", p4.as_dict())
+        _report_llm_quality("p4", p4.as_dict())
 
     baseline_payload = baseline.as_dict()
     p4_payload = p4.as_dict()
@@ -411,10 +412,30 @@ def _resolve_user_target_index(
     return int(info["valid_target_index_end"])
 
 
-def _preflight_deepseek() -> None:
-    if not os.environ.get("DEEPSEEK_API_KEY"):
+def _validate_llm_mode(llm: str) -> None:
+    if llm not in {"fake", "deepseek", "openai"}:
+        raise typer.BadParameter("--llm must be fake, deepseek, or openai")
+
+
+def _configure_live_llm(llm: str, model: str | None, base_url: str | None) -> str:
+    if llm == "deepseek":
+        resolved_model = model or "deepseek-v4-flash"
+        os.environ["DEEPSEEK_MODEL"] = resolved_model
+        if base_url:
+            os.environ["DEEPSEEK_BASE_URL"] = base_url
+        return resolved_model
+    resolved_model = model or "Qwen/Qwen3.8-27B-FP8"
+    os.environ["OPENAI_MODEL"] = resolved_model
+    if base_url:
+        os.environ["OPENAI_BASE_URL"] = base_url
+    os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+    return resolved_model
+
+
+def _preflight_llm(llm: str) -> None:
+    if llm == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY"):
         raise typer.BadParameter("DEEPSEEK_API_KEY is required for DeepSeek evaluation")
-    client = DeepSeekClient()
+    client = DeepSeekClient(provider=llm)
     probe = client.chat_json(
         [
             {"role": "system", "content": "Return JSON only."},
@@ -425,22 +446,26 @@ def _preflight_deepseek() -> None:
     if probe is None or not client.last_usage:
         if probe is not None:
             console.print(
-                "[yellow]DeepSeek preflight returned valid JSON without usage; "
+                "[yellow]LLM preflight returned valid JSON without usage; "
                 "evaluation will continue and record usage_missing_count.[/yellow]"
             )
             return
         raise typer.BadParameter(
-            "DeepSeek preflight failed; check DEEPSEEK_BASE_URL and DEEPSEEK_MODEL"
+            "LLM preflight failed; check the API base URL, model name, and server logs"
         )
 
 
-def _report_deepseek_quality(label: str, payload: dict) -> None:
+def _preflight_deepseek() -> None:
+    _preflight_llm("deepseek")
+
+
+def _report_llm_quality(label: str, payload: dict) -> None:
     usage = payload.get("llm_usage")
     usage_missing_count = int(payload.get("usage_missing_count", 0) or 0)
     fallback_count = int(payload.get("fallback_count", 0) or 0)
     if not usage or not usage.get("total_tokens"):
         console.print(
-            f"[yellow]{label}: no aggregate DeepSeek usage was returned; "
+            f"[yellow]{label}: no aggregate LLM usage was returned; "
             "predictions are retained and usage is marked incomplete.[/yellow]"
         )
     if usage_missing_count:

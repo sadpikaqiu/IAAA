@@ -9,11 +9,31 @@ from typing import Any
 from .models import Intention
 
 
+LIVE_LLM_MODES = {"deepseek", "openai"}
+
+
+def is_live_llm_mode(mode: str) -> bool:
+    return mode in LIVE_LLM_MODES
+
+
 class DeepSeekClient:
-    def __init__(self, model: str | None = None, base_url: str | None = None) -> None:
-        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
-        self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
-        self.api_key = os.environ.get("DEEPSEEK_API_KEY")
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        provider: str = "deepseek",
+    ) -> None:
+        if provider not in {"deepseek", "openai"}:
+            raise ValueError(f"Unsupported LLM provider: {provider}")
+        self.provider = provider
+        if provider == "openai":
+            self.model = model or os.environ.get("OPENAI_MODEL", "Qwen/Qwen3.8-27B-FP8")
+            self.base_url = (base_url or os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")).rstrip("/")
+            self.api_key = os.environ.get("OPENAI_API_KEY", "EMPTY")
+        else:
+            self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+            self.base_url = (base_url or os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")).rstrip("/")
+            self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         self.last_usage: dict[str, int] | None = None
         self.last_raw_content: str | None = None  # 调试用:最后一次响应的原始 content
         self.last_call_status = "not_called"
@@ -38,8 +58,6 @@ class DeepSeekClient:
         if not self.api_key:
             self.last_call_status = "missing_api_key"
             return None
-        # DeepSeek 特有参数(temperature/thinking)仅对 deepseek 系列发送;
-        # 其他网关模型(claude/glm/gpt 等)会拒绝 temperature 或不认 thinking,故省略,只发通用参数。
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -49,6 +67,15 @@ class DeepSeekClient:
         if self.model.startswith("deepseek"):
             payload["temperature"] = 0
             payload["thinking"] = {"type": "disabled"}
+        elif self.model.lower().startswith("qwen"):
+            # IAA-Agent only needs compact structured intention JSON. Disabling
+            # reasoning avoids hidden-token overhead and JSON wrapped in think blocks.
+            payload["temperature"] = float(os.environ.get("OPENAI_TEMPERATURE", "0"))
+            payload["seed"] = int(os.environ.get("OPENAI_SEED", "42"))
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": False,
+                "preserve_thinking": False,
+            }
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),

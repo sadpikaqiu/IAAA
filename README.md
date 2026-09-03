@@ -83,6 +83,11 @@ python -m iaa_agent run --traj-id 349_52 --llm deepseek
 
 Never commit API keys or `.env` files.
 
+To serve the local `Qwen3.8-27B-FP8` checkpoint with vLLM on Linux, follow
+`docs/QWEN38_VLLM_SERVER_SETUP.md`. The evaluation command uses `--llm openai`
+and the standard `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_KEY`
+environment variables.
+
 ## Test
 
 ```powershell

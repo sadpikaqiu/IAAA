@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from .data import NYCDataRepository, QueryExample
-from .llm import DeepSeekClient, parse_intention_or_none
+from .llm import DeepSeekClient, is_live_llm_mode, parse_intention_or_none
 from .models import (
     AffordanceProfile,
     AffordanceVerdict,
@@ -116,7 +116,8 @@ class IAAAgent:
     def __init__(self, repo: NYCDataRepository, config: RunConfig | None = None) -> None:
         self.repo = repo
         self.config = config or RunConfig()
-        self.llm = DeepSeekClient()
+        provider = self.config.llm_mode if is_live_llm_mode(self.config.llm_mode) else "deepseek"
+        self.llm = DeepSeekClient(provider=provider)
         self.last_intention_source = "not_run"
         self.last_llm_status = "not_called"
 
@@ -166,20 +167,24 @@ class IAAAgent:
         )
 
         intention = self._infer_intention(context, profile, peers, query)
-        llm_usage = self.llm.last_usage if self.config.llm_mode == "deepseek" else None
+        llm_usage = self.llm.last_usage if is_live_llm_mode(self.config.llm_mode) else None
         intention_observations = [
             intention.summary,
             f"confidence={intention.confidence:.2f}",
         ]
         intention_params = {"llm_mode": self.config.llm_mode}
-        if self.config.llm_mode == "deepseek":
+        if is_live_llm_mode(self.config.llm_mode):
             intention_params["intention_source"] = self.last_intention_source
-            intention_params["deepseek_status"] = self.last_llm_status
+            intention_params["llm_status"] = self.last_llm_status
+            if self.config.llm_mode == "deepseek":
+                intention_params["deepseek_status"] = self.last_llm_status
         if llm_usage:
             hit = llm_usage.get("prompt_cache_hit_tokens", 0)
             miss = llm_usage.get("prompt_cache_miss_tokens", 0)
-            intention_params["deepseek_usage"] = llm_usage
-            intention_observations.append(f"DeepSeek cache hit/miss tokens: {hit}/{miss}")
+            intention_params["llm_usage"] = llm_usage
+            if self.config.llm_mode == "deepseek":
+                intention_params["deepseek_usage"] = llm_usage
+            intention_observations.append(f"LLM cache hit/miss tokens: {hit}/{miss}")
         trace.append(
             ToolCallRecord(
                 state="S1_INTENTION_INFERRED",
@@ -366,7 +371,7 @@ class IAAAgent:
         heuristic = self._heuristic_intention(context, profile, peers, query)
         self.last_intention_source = "heuristic"
         self.last_llm_status = "not_requested"
-        if self.config.llm_mode != "deepseek":
+        if not is_live_llm_mode(self.config.llm_mode):
             return heuristic
         if not self.llm.available:
             self.last_intention_source = "heuristic_fallback"
@@ -392,7 +397,7 @@ class IAAAgent:
         )
         intention = parse_intention_or_none(data)
         if intention is not None:
-            self.last_intention_source = "deepseek"
+            self.last_intention_source = self.config.llm_mode
             self.last_llm_status = self.llm.last_call_status
             return intention
         self.last_intention_source = "heuristic_fallback"
