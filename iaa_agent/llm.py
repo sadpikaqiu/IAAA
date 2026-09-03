@@ -37,6 +37,7 @@ class DeepSeekClient:
         self.last_usage: dict[str, int] | None = None
         self.last_raw_content: str | None = None  # 调试用:最后一次响应的原始 content
         self.last_reasoning_content: str | None = None
+        self.last_finish_reason: str | None = None
         self.last_call_status = "not_called"
         self.last_error_type: str | None = None
         self.usage_totals: dict[str, int] = {
@@ -44,6 +45,7 @@ class DeepSeekClient:
             "prompt_cache_hit_tokens": 0,
             "prompt_cache_miss_tokens": 0,
             "completion_tokens": 0,
+            "reasoning_tokens": 0,
             "total_tokens": 0,
         }
 
@@ -55,6 +57,7 @@ class DeepSeekClient:
         self.last_usage = None
         self.last_raw_content = None
         self.last_reasoning_content = None
+        self.last_finish_reason = None
         self.last_call_status = "not_called"
         self.last_error_type = None
         if not self.api_key:
@@ -86,6 +89,10 @@ class DeepSeekClient:
                 "preserve_thinking": False,
             }
             if enable_thinking:
+                # Applying a JSON grammar from the first generated token prevents
+                # Qwen from completing its think block. The qwen3 reasoning parser
+                # separates the unconstrained reasoning from the final JSON.
+                payload.pop("response_format", None)
                 payload["chat_template_kwargs"]["reasoning_effort"] = reasoning_effort
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -110,17 +117,27 @@ class DeepSeekClient:
             self.last_error_type = type(exc).__name__
             return None
         self._record_usage(data.get("usage"))
-        message = data.get("choices", [{}])[0].get("message", {})
+        choice = data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        self.last_finish_reason = choice.get("finish_reason")
         content = message.get("content", "")
         self.last_raw_content = content
         self.last_reasoning_content = message.get("reasoning_content")
         if not content:
-            self.last_call_status = "empty_content"
+            self.last_call_status = (
+                "length_truncated"
+                if self.last_finish_reason == "length"
+                else "empty_content"
+            )
             return None
         try:
             parsed = json.loads(_extract_json(content))
         except json.JSONDecodeError as exc:
-            self.last_call_status = "invalid_content_json"
+            self.last_call_status = (
+                "length_truncated"
+                if self.last_finish_reason == "length"
+                else "invalid_content_json"
+            )
             self.last_error_type = type(exc).__name__
             return None
         self.last_call_status = "success"
@@ -132,12 +149,18 @@ class DeepSeekClient:
             "prompt_cache_hit_tokens",
             "prompt_cache_miss_tokens",
             "completion_tokens",
+            "reasoning_tokens",
             "total_tokens",
         }
         if not isinstance(usage, dict) or not usage:
             self.last_usage = None
             return
         parsed = {field: int(usage.get(field, 0) or 0) for field in fields}
+        completion_details = usage.get("completion_tokens_details")
+        if isinstance(completion_details, dict):
+            parsed["reasoning_tokens"] = int(
+                completion_details.get("reasoning_tokens", 0) or 0
+            )
         if parsed["total_tokens"] == 0:
             parsed["total_tokens"] = parsed["prompt_tokens"] + parsed["completion_tokens"]
         if not any(parsed.values()):

@@ -177,7 +177,7 @@ def evaluate_command(
     ),
     llm_max_tokens: Optional[int] = typer.Option(
         None,
-        help="Optional live-LLM completion-token limit; thinking runs should use at least 2048",
+        help="Optional live-LLM completion-token limit; thinking runs should use at least 4096",
     ),
     report_stratified: bool = typer.Option(
         False,

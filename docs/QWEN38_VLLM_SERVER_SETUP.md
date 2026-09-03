@@ -138,15 +138,17 @@ python -m iaa_agent evaluate \
   --base-url http://127.0.0.1:8000/v1 \
   --thinking \
   --reasoning-effort medium \
-  --llm-max-tokens 2048 \
+  --llm-max-tokens 4096 \
   --concurrency 8 \
   --no-allow-fallback \
   --report-stratified \
   --out outputs/evaluation/qwen38_thinking_smoke50.json
 ```
 
-先比较 50-session 的 JSON 成功率、平均 completion tokens、吞吐和推荐指标，
-再决定是否运行全量思考版。`xhigh` 可能显著增加延迟，初始对照推荐 `medium`。
+思考请求不能同时使用从首 token 生效的 JSON grammar，否则模型无法完成 think
+block；客户端会改用 prompt 约束并解析最终 JSON。先比较 50-session 的 JSON
+成功率、reasoning/completion tokens、吞吐和推荐指标，再决定是否运行全量思考
+版。`xhigh` 可能显著增加延迟，初始对照推荐 `medium + 4096 tokens`。
 
 ## 7. 验收标准
 
