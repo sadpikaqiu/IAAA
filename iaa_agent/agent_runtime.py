@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 from pydantic import ValidationError
 
-from .llm import DeepSeekClient
+from .llm import DeepSeekClient, _extract_json
 
 
 def canonical(value):
@@ -26,6 +26,20 @@ def now():
 
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def strict_response_json(content):
+    """Reject repeated object keys before JSON parsing can silently discard them."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"Duplicate JSON object key: {key}. Each key may occur only once.")
+            result[key] = value
+        return result
+    if not isinstance(content, str):
+        raise ValueError("Structured response has no raw JSON text")
+    return json.loads(_extract_json(content), object_pairs_hook=unique_object)
 
 
 def atomic_json(path, value):
@@ -114,6 +128,8 @@ class JournaledModel:
                 return candidate, "full_previous_response"
         projection = {}
         if isinstance(parsed, dict):
+            if "working_poi_selection" in parsed:
+                projection["working_poi_selection"] = parsed["working_poi_selection"]
             if "working_poi_ids" in parsed:
                 projection["working_poi_ids"] = parsed["working_poi_ids"]
             if isinstance(parsed.get("ranked_pois"), list):
@@ -145,6 +161,8 @@ class JournaledModel:
         self.used_labels.append(label)
         for a in record["attempts"]:
             if a.get("accepted"):
+                if schema is not None and strict_response_json(a.get("raw_content")) != a["parsed"]:
+                    raise ValueError(f"Cached raw/parsed response mismatch: {label}")
                 return validator(a["parsed"])
         while True:
             retries = self.accounting()["retries"]
@@ -177,6 +195,9 @@ class JournaledModel:
                     raise ValueError(f"Model response status={self.client.last_call_status}; finish={self.client.last_finish_reason}")
                 if not self.client.last_usage or not self.client.last_usage.get("total_tokens"):
                     raise ValueError("Model response has no token usage")
+                if schema is not None:
+                    parsed = strict_response_json(self.client.last_raw_content)
+                    attempt["parsed"] = parsed
                 result = validator(parsed)
                 attempt["accepted"] = True
             except Exception as exc:

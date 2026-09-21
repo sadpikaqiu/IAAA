@@ -9,8 +9,9 @@ from jsonschema import Draft202012Validator
 from test_poi_evidence import fixture, A, B, C, D
 from iaa_agent.agent_types import AgentConfig, VisibleQuery, ToolRequest
 from iaa_agent.agent_tools import POIToolService
-from iaa_agent.agent_runtime import JournaledModel, PromptBudget, read_json
-from iaa_agent.autonomous import AutonomousAgent, rerank_fixed_result, compact_observations
+from iaa_agent.agent_runtime import JournaledModel, PromptBudget, read_json, strict_response_json
+from iaa_agent.autonomous import (AutonomousAgent, rerank_fixed_result, compact_observations,
+                                 decode_working_selection, decision_selection_schema)
 from iaa_agent.data import NYCDataRepository
 from iaa_agent.engine import IAAAgent, RunConfig
 from iaa_agent.evidence import EvidenceStore
@@ -23,6 +24,12 @@ class CharacterTokenizer:
         return "".join(tokens)
     def apply_chat_template(self, messages, **kwargs):
         return list("".join(m["content"] for m in messages))
+
+
+def selection_response(decision):
+    value = deepcopy(decision)
+    value["working_poi_selection"] = dict.fromkeys(value.pop("working_poi_ids"), True)
+    return value
 
 
 class ScriptedClient:
@@ -64,6 +71,8 @@ class ScriptedClient:
                     args.append(params)
                 result = {"intention": result["intention"], "working_poi_ids": self.seen,
                           "tool_args": args, "reason": result["reason"]}
+        if "working_poi_ids" in result:
+            result = selection_response(result)
         self.last_raw_content = json.dumps(result)
         self.last_usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
         self.last_call_status, self.last_finish_reason = "success", "stop"
@@ -239,15 +248,17 @@ def test_duplicate_repair_receives_previous_answer_and_specific_ids(fixture, tmp
         def chat_json(self, messages, **kwargs):
             result = super().chat_json(messages, **kwargs)
             rank = "ranked_pois" in result
-            ready = rank if failure_stage == "ranking" else bool(result.get("working_poi_ids"))
+            ready = rank if failure_stage == "ranking" else bool(result.get("working_poi_selection"))
             if self.bad_response is None and ready:
                 result = deepcopy(result)
                 if rank:
                     result["ranked_pois"][1] = deepcopy(result["ranked_pois"][0])
-                else:
-                    result["working_poi_ids"][1] = result["working_poi_ids"][0]
                 self.bad_response = deepcopy(result)
                 self.last_raw_content = json.dumps(result)
+                if not rank:
+                    key = next(iter(result["working_poi_selection"]))
+                    pair = json.dumps(key) + ": true"
+                    self.last_raw_content = self.last_raw_content.replace(pair, pair + ", " + pair, 1)
             return result
     _, _, tools = service(fixture)
     config = AgentConfig(top_k=2)
@@ -256,8 +267,12 @@ def test_duplicate_repair_receives_previous_answer_and_specific_ids(fixture, tmp
     repairs = [messages for messages, _ in client.calls if len(messages) > 2]
     assert len(repairs) == 1
     assert json.loads(repairs[0][-2]["content"]) == client.bad_response
-    assert "1-based positions" in repairs[0][-1]["content"]
-    assert "[1, 2]" in repairs[0][-1]["content"]
+    if failure_stage == "ranking":
+        assert "1-based positions" in repairs[0][-1]["content"]
+        assert "[1, 2]" in repairs[0][-1]["content"]
+    else:
+        assert "Duplicate JSON object key" in repairs[0][-1]["content"]
+        assert next(iter(client.bad_response["working_poi_selection"])) in repairs[0][-1]["content"]
     assert result["accounting"]["retries"] == 1
     assert result["accounting"]["invalid_attempts"] == 1
     assert result["accounting"]["usage"]["total_tokens"] == 600
@@ -278,7 +293,7 @@ def test_intermediate_working_set_cannot_drop_below_ranking_size(fixture, tmp_pa
     _, _, tools = service(fixture)
     AutonomousAgent(tools, model(tmp_path / "run", config, client), config).run()
     schema = client.calls[1][1]["request_options"]["response_format"]["json_schema"]["schema"]
-    assert all(branch["properties"]["working_poi_ids"]["minItems"] == 2 for branch in schema["anyOf"])
+    assert all(branch["properties"]["working_poi_selection"]["minProperties"] == 2 for branch in schema["anyOf"])
 
 
 def test_emitted_schema_couples_stop_with_tool_count(fixture, tmp_path):
@@ -291,17 +306,17 @@ def test_emitted_schema_couples_stop_with_tool_count(fixture, tmp_path):
     for value in (first_schema, schema):
         Draft202012Validator.check_schema(value)
     validator = Draft202012Validator(schema)
-    valid = result["trace"][1]["decision"]
+    valid = selection_response(result["trace"][1]["decision"])
     request = {"name": "recall_pois", "args": {"source": "historical"}}
     for stop, count, accepted in [(False, 0, False), (False, 1, True), (False, 3, True),
                                   (False, 4, False), (True, 0, True), (True, 1, False)]:
         raw = {**valid, "stop": stop, "tools": [request] * count}
         assert validator.is_valid(raw) is accepted, (stop, count)
-    for missing in ("tools", "working_poi_ids", "stop"):
+    for missing in ("tools", "working_poi_selection", "stop"):
         incomplete = {k: v for k, v in valid.items() if k != missing}
         assert not validator.is_valid(incomplete), missing
     # Before enough candidates are known, stopping and a no-op are both impossible.
-    initial = result["trace"][0]["decision"]
+    initial = selection_response(result["trace"][0]["decision"])
     first = Draft202012Validator(first_schema)
     assert first.is_valid(initial)
     assert not first.is_valid({**initial, "stop": True, "tools": []})
@@ -315,10 +330,83 @@ def test_final_schema_requires_stop_without_tools(fixture, tmp_path):
     result = AutonomousAgent(tools, model(tmp_path, config, client), config).run()
     schema = client.calls[1][1]["request_options"]["response_format"]["json_schema"]["schema"]
     validator = Draft202012Validator(schema)
-    valid = result["trace"][1]["decision"]
+    valid = selection_response(result["trace"][1]["decision"])
     assert validator.is_valid(valid)
     assert not validator.is_valid({**valid, "stop": False})
     assert not validator.is_valid({**valid, "tools": [{"name": "list_candidates", "args": {}}]})
+
+
+@pytest.mark.parametrize("engine", ["autonomous", "fixed_schedule"])
+def test_model_selection_is_explicit_bounded_and_registered(fixture, tmp_path, engine):
+    _, _, tools = service(fixture)
+    config = AgentConfig(top_k=2, max_candidates=4, engine=engine)
+    client = ScriptedClient()
+    # Use a schema captured during an ordinary run, with the real registered pool.
+    result = AutonomousAgent(tools, model(tmp_path, config, client), config).run()
+    schema = client.calls[1][1]["request_options"]["response_format"]["json_schema"]["schema"]
+    branches = schema.get("anyOf", [schema])
+    selection_schema = branches[0]["properties"]["working_poi_selection"]
+    check = Draft202012Validator(selection_schema)
+    ids = list(selection_schema["properties"])
+    chosen = {p: True for p in ids[:2]}
+    assert check.is_valid(chosen)
+    assert not check.is_valid({})
+    assert not check.is_valid({"P999999": True, **chosen})
+    assert not check.is_valid({ids[0]: False, ids[1]: True})
+    assert not check.is_valid({ids[0]: 1, ids[1]: True})
+    assert not check.is_valid(ids[:2])
+    decoded = decode_working_selection({"working_poi_selection": chosen})
+    assert decoded["working_poi_ids"] == list(chosen)
+    with pytest.raises(ValueError, match="map selected"):
+        decode_working_selection({"working_poi_selection": {ids[0]: 1}})
+    with pytest.raises(ValueError, match="not working_poi_ids"):
+        decode_working_selection({"working_poi_ids": ids, "working_poi_selection": chosen})
+    assert len(result["ranked_pois"]) == 2
+
+
+def test_selection_cardinality_cap_and_initial_empty_schema():
+    from iaa_agent.agent_types import AgentDecision
+    original = AgentDecision.model_json_schema()
+    ids = [f"P{i:06d}" for i in range(80)]
+    schema = decision_selection_schema(original, ids, minimum=10, maximum=60)
+    check = Draft202012Validator(schema["properties"]["working_poi_selection"])
+    assert check.is_valid(dict.fromkeys(ids[:10], True))
+    assert check.is_valid(dict.fromkeys(ids[:60], True))
+    assert not check.is_valid(dict.fromkeys(ids[:9], True))
+    assert not check.is_valid(dict.fromkeys(ids[:61], True))
+    empty = decision_selection_schema(original, [], minimum=0, maximum=60)
+    first = Draft202012Validator(empty["properties"]["working_poi_selection"])
+    assert first.is_valid({})
+    assert not first.is_valid({ids[0]: True})
+    assert "working_poi_ids" in original["properties"]  # Internal contract is unchanged.
+
+
+def test_duplicate_raw_selection_is_rejected_even_after_standard_json_collapses_it():
+    raw = '{"working_poi_selection":{"P000221":true,"P000221":true}}'
+    assert json.loads(raw)["working_poi_selection"] == {"P000221": True}
+    with pytest.raises(ValueError, match="Duplicate JSON object key: P000221"):
+        strict_response_json(raw)
+    with pytest.raises(ValueError, match="Duplicate JSON object key: stop"):
+        strict_response_json('{"stop":false,"stop":true}')
+    assert strict_response_json('```json\n{"working_poi_selection":{"P000221":true}}\n```') == json.loads(raw)
+
+
+def test_resume_rejects_duplicate_raw_keys_without_new_request(fixture, tmp_path):
+    config = AgentConfig(top_k=2)
+    _, _, tools = service(fixture)
+    AutonomousAgent(tools, model(tmp_path, config), config).run()
+    path = tmp_path / "calls/decision_02.json"
+    record = read_json(path)
+    attempt = record["attempts"][0]
+    key = next(iter(attempt["parsed"]["working_poi_selection"]))
+    pair = json.dumps(key) + ": true"
+    attempt["raw_content"] = attempt["raw_content"].replace(pair, pair + ", " + pair, 1)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    client = ScriptedClient()
+    client.chat_json = lambda *a, **k: pytest.fail("Corrupt accepted journal must not trigger a request")
+    _, _, tools = service(fixture)
+    with pytest.raises(ValueError, match="Duplicate JSON object key"):
+        AutonomousAgent(tools, model(tmp_path, config, client), config).run()
 
 
 def test_noop_repair_can_choose_early_stop_without_extra_tool(fixture, tmp_path):

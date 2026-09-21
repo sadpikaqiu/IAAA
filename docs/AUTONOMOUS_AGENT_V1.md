@@ -41,6 +41,7 @@ C 与 D 的实际调用数可不同，预算上限相同；不能把它们称为
 - 修复提示包含具体重复 ID、位置、不同 ID 数量及上一版错误答案；若上下文较长则缩为 ID 摘要，原始事实不删除。结果仍须通过原有唯一性、候选范围与引用校验，不自动补齐排名。
 - 新决策/排名使用 JSON Schema 约束；未知 ID、重复排名和跨 POI 引用仍由程序校验。
 - 自主决策的生成 Schema 使用两个完整分支约束控制行为：继续必须有至少一个工具，停止必须为空工具列表，字段不得省略。候选不足时只允许继续，预算收尾时只允许停止；模型可在候选充足时提前停止，不必等到第六轮。
+- fix03 的 C/D 决策使用 `working_poi_selection` 对象选择候选，例如 `{"P000001":true,"P000003":true}`。已登记 ID 是允许的键，模型按 ID 升序填写所选项，其余省略；Schema 限制键和数量。服务器 xgrammar 0.2.3 实测会忽略数组 `uniqueItems`，但此对象结构可阻止重复键。程序仍独立检查原始 JSON 重复键、候选范围与数量，再将模型明确选出的键转为内部 `working_poi_ids` 列表，不替模型选点或补齐候选。最终排名仍保留逐项 POI 与引用校验。
 - C 的工具名、顺序和停止由程序派发，模型只生成参数，避免把固定对照误做成自主调度。
 - 请求超时 180 秒、会话期限 1200 秒；每会话最多 2 次额外修复/重试。失败不使用启发式预测兜底。
 - 日志记录每次请求、响应、错误、usage、工具结果、候选变更和停止原因。有效请求可复用，已开始但中断的请求仍占重试预算。
@@ -109,14 +110,14 @@ B 的独立运行成本含 A 的共享意图调用，物理请求汇总只计实
 ## 后台运行
 
 ```bash
-screen -dmS iaaa-autonomous-fix02-0921 bash scripts/run_autonomous_screen.sh \
-  /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix02
+screen -dmS iaaa-autonomous-fix03-0921 bash scripts/run_autonomous_screen.sh \
+  /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix03
 ```
 
 先核对 `screen -ls` 和 progress.json，避免重复启动。查看：
 
 ```bash
-tail -f /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix02/runner.log
+tail -f /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix03/runner.log
 ```
 
 离线重建报告：`python scripts/report_autonomous.py --results <结果目录>`，不调用模型。

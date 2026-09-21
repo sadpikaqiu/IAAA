@@ -6,6 +6,8 @@
 
 2026-09-21 增补：后继版本 `autonomous_v1_20260921_fix02` 进一步将停止标志与工具数量绑定到生成 Schema，防止 `stop=false` 却没有工具的无动作决策。下文已补充这一约束；第 14 节仍明确保留 fix01 的真实历史案例，不将其归入新版结果。新版本协议和验证状态以其 `RUN_RECORD.md` 为准。
 
+同日 fix03 增补：NYC 开发会话出现重复工作候选耗尽修复预算。实测当前 xgrammar 0.2.3 忽略数组 `uniqueItems`；C/D 决策改用 ID 为键、值为 `true` 的候选集合对象，由动态 Schema 限制可选键及数量，并在原始 JSON 解析时拒绝重复键。内部状态仍保存 ID 列表，最终排名接口不变。fix03 单独冻结、重新生成正式阶段预测，不混用旧版结果。
+
 **当前系统由一个 Qwen 模型负责多轮决策：根据可见轨迹提出意图假设，自主选择本地检索与证据工具，调整候选集合，决定何时停止查找，再单独生成 Top-10 推荐。** 程序负责执行工具、保存状态、限制预算、校验输出和计算评估指标。
 
 本文描述实现机制，不把开发阶段的个别成功案例当作推荐效果或全量稳定性结论。
@@ -135,7 +137,7 @@ POI 目录使用全数据已知的 ID、类别和坐标，因此未被该用户�
 |---|---|---|
 | `intention` | 当前活动目标、类别假设和不确定性 | 每轮模型可重新给出 |
 | `registry` | 已经登记的候选总表 | 召回、证据搜索、允许的候选检查逐步增加 |
-| `working` | 当前重点比较的候选集合 | 每轮由 `working_poi_ids` 整体替换 |
+| `working` | 当前重点比较的候选集合 | 每轮由模型的 `working_poi_selection` 整体替换，内部存成 `working_poi_ids` 列表 |
 | `references` | 结构化事实和外部证据引用台账 | 登记候选、阅读证据时积累 |
 | `evidence_refs` | 每个 POI 已读取的外部证据引用 | `read_evidence` 后积累 |
 | `latest_observations` | 上一轮工具的结果或错误 | 每轮替换，传给下一次决策 |
@@ -193,7 +195,7 @@ budget                当前轮次、剩余工具次数、是否只能收尾、T
     "categories": ["Food & Drink Shop"],
     "uncertainty": ["A familiar destination or a new nearby venue may both fit."]
   },
-  "working_poi_ids": [],
+  "working_poi_selection": {},
   "tools": [
     {
       "name": "recall_pois",
@@ -209,9 +211,9 @@ budget                当前轮次、剩余工具次数、是否只能收尾、T
 }
 ```
 
-`reason` 是简短的动作解释。`working_poi_ids` 是整份新工作集合，不是只填本轮增加的 ID。
+`reason` 是简短的动作解释。`working_poi_selection` 是整份新工作集合，不是只填本轮增加的 ID。例如 `{"P000001":true,"P000003":true}` 表示模型选择这两个已经登记的 POI；未选 ID 省略，键按 ID 升序输出。这里的顺序不表示推荐名次，最终排名另有独立步骤。首轮没有登记候选时只能填写空对象。
 
-程序会针对当前登记表动态生成 JSON Schema，限制允许的候选 ID 和数组数量，再用 Pydantic 与额外校验检查重复、越界、工具预算和停止条件。
+程序会针对当前登记表动态生成 JSON Schema，将每个允许 ID 声明为可选键，禁止额外键，限制键数量和仅允许 `true` 的值。服务器实际解码器已验证能阻止重复键、未知 ID、少于下限或超过上限的集合，覆盖空登记表、40 和 600 个候选。接收端在标准 JSON 解析可能覆盖重复键之前独立拒绝重复键，再将合法选择转为内部 ID 列表，并用 Pydantic 与额外校验检查越界、工具预算和停止条件。程序不会去重后接受错误结果，不增选候选，也不补齐排名。
 
 fix02 将自主决策的 Schema 写成两个互斥的完整分支：`stop=false` 对应 1 到剩余允许数量的工具，`stop=true` 对应空工具列表，且 `stop`、`tools`、工作集合等字段必须显式返回。候选不足时仅保留继续分支，强制收尾时仅保留停止分支。这是把原有校验规则提前到约束生成阶段，不增加修复预算，也不自动改写模型的停止决定。
 
@@ -496,7 +498,7 @@ C 不能改工具顺序或提前停止，但仍由模型更新意图、填写允
 
 ## 14. 一个真实运行案例：652 / 652_38
 
-以下来自 fix01 已经完成的 NYC 开发会话，组别为 `autonomous__both`。它用于说明该版本的实际行动路径，不用于评价多模态收益或代表 fix02 的查询策略。
+以下来自 fix01 已经完成的 NYC 开发会话，组别为 `autonomous__both`。它用于说明该版本的实际行动路径，不用于评价多模态收益或代表后继版本的查询策略。
 
 来源文件：
 
@@ -526,10 +528,10 @@ C 不能改工具顺序或提前停止，但仍由模型更新意图、填写允
 
 ## 15. 如何查看运行现场
 
-服务器环境为 Conda `iaaa`。fix02 实验 screen 为：
+服务器环境为 Conda `iaaa`。fix03 实验 screen 为：
 
 ```bash
-screen -r iaaa-autonomous-fix02-0921
+screen -r iaaa-autonomous-fix03-0921
 ```
 
 按 `Ctrl-a` 后按 `1` 查看实时进度，按 `0` 查看 runner 日志，按 `d` 脱离 screen。进度窗口每 10 秒读取已保存状态，不执行推荐请求。
@@ -545,11 +547,11 @@ autonomous__both:decision_03
 也可以直接查看：
 
 ```bash
-cat /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix02/results/progress.json
-tail -f /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix02/runner.log
+cat /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix03/results/progress.json
+tail -f /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix03/runner.log
 ```
 
-fix01 的进度显示曾以独立的 `ops/watch_autonomous.py` 补充；fix02 已创建并核验使用 `code/scripts/watch_autonomous.py` 的进度窗口。工作区启动脚本进一步修正了窗口存在性判断，后续启动按实际窗口列表创建；当前冻结目录的显示操作记录在 RUN_RECORD.md。显示器不会修改评估状态或模型输出。
+fix01 的进度显示曾以独立的 `ops/watch_autonomous.py` 补充；fix02 使用 `code/scripts/watch_autonomous.py`，但旧启动脚本误判窗口存在。fix03 启动脚本按实际窗口列表创建进度窗口；显示操作与运行核验记录在 RUN_RECORD.md。显示器不会修改评估状态或模型输出。
 
 ## 16. 单独运行一个会话
 
@@ -558,7 +560,7 @@ fix01 的进度显示曾以独立的 `ops/watch_autonomous.py` 补充；fix02 �
 ```bash
 source /home/yzj/miniconda3/etc/profile.d/conda.sh
 conda activate iaaa
-cd /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix02/code
+cd /home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix03/code
 
 python -m iaa_agent run-agent \
   --user-id 652 \
