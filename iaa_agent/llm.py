@@ -70,7 +70,9 @@ class DeepSeekClient:
     def available(self) -> bool:
         return bool(self.api_key)
 
-    def chat_json(self, messages: list[dict[str, str]], max_tokens: int = 900) -> dict[str, Any] | None:
+    def chat_json(self, messages: list[dict[str, str]], max_tokens: int = 900,
+                  *, request_options: dict[str, Any] | None = None,
+                  timeout_seconds: float | None = None) -> dict[str, Any] | None:
         self.last_usage = None
         self.last_raw_content = None
         self.last_reasoning_content = None
@@ -111,6 +113,13 @@ class DeepSeekClient:
                 # separates the unconstrained reasoning from the final JSON.
                 payload.pop("response_format", None)
                 payload["chat_template_kwargs"]["reasoning_effort"] = reasoning_effort
+        # Explicit per-call options take precedence without changing legacy
+        # environment-based behavior or mutating shared process settings.
+        if request_options is not None:
+            allowed = {"max_tokens", "temperature", "seed", "chat_template_kwargs", "response_format"}
+            if set(request_options) - allowed:
+                raise ValueError("Unsupported per-call generation option")
+            payload.update(request_options)
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -121,7 +130,7 @@ class DeepSeekClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+            with urllib.request.urlopen(req, timeout=timeout_seconds or self.timeout_seconds) as resp:
                 raw_response = resp.read().decode("utf-8")
         except (urllib.error.URLError, TimeoutError) as exc:
             self.last_call_status = "request_error"

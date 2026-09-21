@@ -1,0 +1,3 @@
+# Keep source and Linux launch scripts consistent across checkouts.
+*.py text eol=lf
+*.sh text eol=lf

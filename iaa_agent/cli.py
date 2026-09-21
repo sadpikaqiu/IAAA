@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import math
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +20,7 @@ from rich.progress import (
 
 from .data import NYCDataRepository
 from .engine import IAAAgent, RunConfig
+from .evidence import EvidenceStore
 from .evaluation import (
     evaluate_session_split,
     evaluate_session_split_stratified,
@@ -30,6 +33,59 @@ from .utils import read_json, write_json
 
 app = typer.Typer(help="IAA-Agent NYC-first CLI")
 console = Console()
+
+
+@app.command("run-agent")
+def run_agent(
+    user_id: str = typer.Option(..., help="User ID for a session query"),
+    trajectory_id: str = typer.Option(..., help="Session trajectory ID"),
+    data_dir: str = typer.Option("datasets/NYC"),
+    engine: str = typer.Option("autonomous", help="fixed, fixed_llm_rank, fixed_schedule, autonomous"),
+    train_ratio: float = typer.Option(.8),
+    evidence_snapshot: Optional[str] = typer.Option(None),
+    evidence_mode: str = typer.Option("both", help="both, images, reviews"),
+    tokenizer_path: str = typer.Option("/home/yzj/Model/Qwen38-27B"),
+    output_dir: str = typer.Option("outputs/agent_runs"),
+    model: str = typer.Option("Qwen/Qwen3.8-27B-FP8"),
+    base_url: str = typer.Option("http://127.0.0.1:8000/v1"),
+) -> None:
+    """Run a resumable single-session agent; existing commands retain their defaults."""
+    from .agent_types import AgentConfig, VisibleQuery
+    from .agent_runtime import atomic_json, digest, load_tokenizer
+    from .agent_evaluation import run_variant
+    if engine not in {"fixed", "fixed_llm_rank", "fixed_schedule", "autonomous"}:
+        raise typer.BadParameter("Unknown engine")
+    os.environ.update(OPENAI_MODEL=model, OPENAI_BASE_URL=base_url,
+                      OPENAI_ENABLE_THINKING="0", OPENAI_TEMPERATURE="0", OPENAI_SEED="42")
+    os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+    repo = NYCDataRepository(data_dir)
+    repo.use_user_chronological_split(train_ratio)
+    query = repo.get_session_query(user_id, trajectory_id, train_ratio=train_ratio)
+    visible = VisibleQuery.from_query(query)
+    store = EvidenceStore(evidence_snapshot, mode=evidence_mode) if evidence_snapshot else None
+    if store:
+        store.validate_repository(repo)
+    # Per-engine settings are selected by run_variant; shared A/B cache identity
+    # must not depend on which CLI engine was requested first.
+    config = AgentConfig()
+    identity = digest({"code": {p.name: digest(p.read_bytes()) for p in Path(__file__).parent.glob("*.py")},
+                       "config": asdict(config), "csv": {p.name: digest(p.read_bytes()) for p in Path(data_dir).glob("*.csv")},
+                       "snapshot": store.snapshot_id if store else None, "mode": evidence_mode,
+                       "query": visible.query_id, "time": visible.target_time, "ratio": train_ratio,
+                       "model": model, "base_url": base_url})
+    root = Path(output_dir) / f"{user_id}__{trajectory_id}" / (evidence_mode if store else "text")
+    tokenizer = load_tokenizer(tokenizer_path)
+    baseline = None
+    if engine == "fixed_llm_rank":
+        baseline = run_variant("fixed", evidence_mode if store else "text", repo, query, store,
+                               root / "fixed", identity, tokenizer, config)
+    result = run_variant(engine, evidence_mode if store else "text", repo, query, store,
+                         root / engine, identity, tokenizer, config, baseline_result=baseline)
+    # Labels are attached only by this evaluation-facing caller, after prediction.
+    atomic_json(root / engine / "evaluation.json", {"ground_truth_poi_id": str(query.target["POI_id"]),
+                "predictions": [p["poi_id"] for p in result["ranked_pois"]]})
+    console.print({"engine": engine, "prediction": str((root / engine / "prediction.json").resolve()),
+                   "accounting": result["accounting"]})
 
 
 @app.command()
@@ -50,10 +106,13 @@ def run(
     data_dir: str = typer.Option("datasets/NYC", help="Directory containing NYC_train/val/test.csv"),
     out: Optional[str] = typer.Option(None, help="JSON output path"),
     llm: str = typer.Option("fake", help="LLM mode: fake, deepseek, or openai"),
+    evidence_snapshot: Optional[str] = typer.Option(None, help="Complete frozen POI evidence JSON"),
+    evidence_mode: str = typer.Option("both", help="both, reviews, or images"),
 ) -> None:
     _validate_llm_mode(llm)
     repo = NYCDataRepository(data_dir)
-    agent = IAAAgent(repo, RunConfig(llm_mode=llm))
+    config = RunConfig(llm_mode=llm, evidence_snapshot=evidence_snapshot, evidence_mode=evidence_mode)
+    agent = IAAAgent(repo, config, evidence_store=_load_evidence(repo, config))
     result = agent.run(traj_id)
     payload = result.model_dump(mode="json")
     target = out or f"outputs/runs/{traj_id}.json"
@@ -92,6 +151,8 @@ def run_user(
     context_size: int = typer.Option(5, help="Number of previous check-ins used as short-term context"),
     out: Optional[str] = typer.Option(None, help="JSON output path"),
     llm: str = typer.Option("fake", help="LLM mode: fake, deepseek, or openai"),
+    evidence_snapshot: Optional[str] = typer.Option(None, help="Complete frozen POI evidence JSON"),
+    evidence_mode: str = typer.Option("both", help="both, reviews, or images"),
 ) -> None:
     _validate_llm_mode(llm)
     repo = NYCDataRepository(data_dir)
@@ -106,7 +167,8 @@ def run_user(
         )
     except (KeyError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
-    agent = IAAAgent(repo, RunConfig(llm_mode=llm))
+    config = RunConfig(llm_mode=llm, evidence_snapshot=evidence_snapshot, evidence_mode=evidence_mode)
+    agent = IAAAgent(repo, config, evidence_store=_load_evidence(repo, config))
     result = agent.run_query(query)
     payload = result.model_dump(mode="json")
     target = out or f"outputs/runs/user_{user_id}_idx_{resolved_target_index}.json"
@@ -188,6 +250,12 @@ def evaluate_command(
         "--report-stratified",
         help="Report IH/OOH, cold-start, and context-length metrics from the same predictions.",
     ),
+    evidence_snapshot: Optional[str] = typer.Option(None, help="Complete frozen POI evidence JSON"),
+    evidence_mode: str = typer.Option("both", help="both, reviews, or images"),
+    evidence_weight: float = typer.Option(0.10, help="Weight of lexical evidence relevance, not a probability"),
+    evidence_radius_km: float = typer.Option(10.0, help="Evidence recall radius from last visible location"),
+    report_candidates: bool = typer.Option(False, "--report-candidates", help="Report raw/pool CandidateRecall from these predictions"),
+    intention_context_size: int = typer.Option(0, min=0, help="Recent check-ins in the intention prompt; 0 preserves text baseline, or uses 5 with evidence. Set 5 for both paired variants."),
 ) -> None:
     _validate_llm_mode(llm)
     if variant not in {"mainline", "p4v1"}:
@@ -204,6 +272,17 @@ def evaluate_command(
         raise typer.BadParameter("--reasoning-effort must be low, medium, or xhigh")
     if llm_max_tokens is not None and llm_max_tokens < 1:
         raise typer.BadParameter("--llm-max-tokens must be >= 1")
+    if (evidence_weight < 0 or evidence_radius_km <= 0
+            or not math.isfinite(evidence_weight) or not math.isfinite(evidence_radius_km)):
+        raise typer.BadParameter("--evidence-weight must be >= 0 and --evidence-radius-km must be > 0")
+
+    repo = NYCDataRepository(data_dir)
+    config = RunConfig.p4(llm_mode=llm) if variant == "p4v1" else RunConfig(llm_mode=llm)
+    config.evidence_snapshot, config.evidence_mode = evidence_snapshot, evidence_mode
+    config.evidence_weight, config.evidence_radius_km = evidence_weight, evidence_radius_km
+    config.intention_context_size = intention_context_size
+    # Gate incomplete/mismatched evidence before even the live-model preflight.
+    evidence_store = _load_evidence(repo, config)
 
     resolved_model = None
     resolved_request_timeout = None
@@ -223,10 +302,10 @@ def evaluate_command(
         resolved_model = _configure_live_llm(llm, model, base_url)
         _preflight_llm(llm)
 
-    repo = NYCDataRepository(data_dir)
     actual_smoke_limit = None if smoke_limit == 0 else smoke_limit
     actual_workers = resolve_worker_count(workers)
-    config = RunConfig.p4(llm_mode=llm) if variant == "p4v1" else RunConfig(llm_mode=llm)
+    if llm == "fake" and (evidence_snapshot or report_candidates):
+        actual_workers = 1
 
     if actual_workers > 1 and save_runs is not None:
         console.print("[yellow]保存 trace 时 fake 多进程评估回退为串行执行[/yellow]")
@@ -269,6 +348,8 @@ def evaluate_command(
                     stall_timeout_seconds=stall_timeout,
                     progress_callback=lambda: progress.advance(task),
                     report_stratified=report_stratified,
+                    report_candidates=report_candidates,
+                    evidence_store=evidence_store,
                 )
             _report_llm_quality(variant, result.as_dict())
         else:
@@ -284,6 +365,8 @@ def evaluate_command(
                 run_config=config,
                 strict_llm=is_live_llm_mode(llm) and not allow_fallback,
                 report_stratified=report_stratified and actual_workers == 1,
+                report_candidates=report_candidates,
+                evidence_store=evidence_store,
             )
     except (KeyError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -307,6 +390,9 @@ def evaluate_command(
         ),
     }
     payload["variant"] = variant
+    payload["run_config"] = asdict(config)
+    if evidence_store is not None:
+        payload["evidence_snapshot"] = evidence_store.metadata()
     payload["llm_mode"] = llm
     if resolved_model is not None:
         payload["model"] = resolved_model
@@ -461,6 +547,19 @@ def _resolve_user_target_index(
 def _validate_llm_mode(llm: str) -> None:
     if llm not in {"fake", "deepseek", "openai"}:
         raise typer.BadParameter("--llm must be fake, deepseek, or openai")
+
+
+def _load_evidence(repo: NYCDataRepository, config: RunConfig) -> EvidenceStore | None:
+    if config.evidence_mode not in {"both", "reviews", "images"}:
+        raise typer.BadParameter("--evidence-mode must be both, reviews, or images")
+    if not config.evidence_snapshot:
+        return None
+    try:
+        store = EvidenceStore(config.evidence_snapshot, config.evidence_mode)
+        store.validate_repository(repo)
+        return store
+    except (ValueError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 def _configure_live_llm(llm: str, model: str | None, base_url: str | None) -> str:

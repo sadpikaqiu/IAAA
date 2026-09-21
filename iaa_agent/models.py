@@ -133,6 +133,8 @@ class AffordanceVerdict(BaseModel):
     source_tools: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     conflict: str | None = None
+    evidence_refs: list[dict] = Field(default_factory=list)
+    relevance_score: float | None = None
 
 
 class AffordanceProfile(BaseModel):
@@ -191,3 +193,4 @@ class AgentRunResult(BaseModel):
     ranked_pois: list[RankedPOI]
     reflection: ReflectionRecord
     agent_trace_summary: list[ToolCallRecord]
+    evidence_snapshot: dict | None = None

@@ -41,6 +41,10 @@ class QueryExample:
 class NYCDataRepository:
     def __init__(self, data_dir: str | Path = "datasets/NYC") -> None:
         self.data_dir = Path(data_dir)
+        cities = [city for city in ("NYC", "TKY") if (self.data_dir / f"{city}_train.csv").exists()]
+        if len(cities) != 1:
+            raise ValueError("Data directory must contain exactly one NYC or TKY train/val/test set")
+        self.city = cities[0]
         self.train = self._load_split("train")
         self.val = self._load_split("val")
         self.test = self._load_split("test")
@@ -65,7 +69,7 @@ class NYCDataRepository:
     def capabilities(self) -> DatasetCapabilities:
         return DatasetCapabilities(
             notes=[
-                "Foursquare NYC split has category, coordinates, timestamps, and trajectory_id.",
+                f"Foursquare {self.city} split has category, coordinates, timestamps, and trajectory_id.",
                 "Reviews, images, opening hours, price, and ratings are unavailable in v0.",
             ]
         )
@@ -407,7 +411,7 @@ class NYCDataRepository:
         return [self._row_to_checkin(row) for _, row in df.iterrows()]
 
     def _load_split(self, split: str) -> pd.DataFrame:
-        path = self.data_dir / f"NYC_{split}.csv"
+        path = self.data_dir / f"{self.city}_{split}.csv"
         if not path.exists():
             raise FileNotFoundError(path)
         df = pd.read_csv(path)

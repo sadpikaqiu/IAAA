@@ -1,5 +1,9 @@
 # IAA-Agent NYC-first
 
+自主 Agent v1 已增加 `run-agent --engine autonomous` 单会话入口，以及 A/B/C/D × 轨迹/图文的可恢复配对实验。
+使用方法、预算、数据边界及服务器运行方式见 [自主 Agent v1](docs/AUTONOMOUS_AGENT_V1.md)。原有固定流程命令保持兼容。
+当前决策循环、工具、候选管理、证据引用及真实会话示例见 [自主 Agent 完整流程说明](docs/AUTONOMOUS_AGENT_WORKFLOW.md)。
+
 CLI + JSON demo for an Intention-Affordance Aligned Agent for next POI recommendation.
 
 The current v0 targets the local Foursquare NYC split under `datasets/NYC` and implements a structured mobility affordance workflow:
@@ -19,7 +23,7 @@ datasets/NYC/NYC_val.csv
 datasets/NYC/NYC_test.csv
 ```
 
-The v0 data boundary excludes reviews, images, opening hours, price, and ratings. The agent records these as missing evidence instead of hallucinating unsupported claims.
+The default text baseline excludes reviews, images, opening hours, price, and ratings. An optional frozen WWW2024 evidence snapshot adds review excerpts and image observations to the existing fixed pipeline. Both NYC and TKY CSV directories are supported. See [the multimodal integration guide](docs/MULTIMODAL_EVIDENCE.md) for preparation, coverage gates and paired evaluation.
 
 ## Install
 
@@ -88,8 +92,22 @@ To serve the local `Qwen3.8-27B-FP8` checkpoint with vLLM on Linux, follow
 and the standard `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_KEY`
 environment variables.
 
+## POI image preprocessing
+
+The WWW2024 NYC/TKY image datasets can be summarized with Qwen3.8-Flash before
+integration into the text recommendation agent. See
+[POI image summaries](docs/POI_IMAGE_SUMMARIES.md) for API key loading, multi-image
+aggregation, provenance, and resumable runs.
+
+```powershell
+python -m pip install -e ".[vision]"
+python scripts/summarize_poi_images.py --city both --dry-run
+python scripts/summarize_poi_images.py --city NYC --limit 2 --workers 1
+```
+
 ## Test
 
 ```powershell
+python -m pip install -e ".[test,vision]"
 python -m pytest -q
 ```

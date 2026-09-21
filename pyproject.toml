@@ -17,6 +17,11 @@ dependencies = [
   "scikit-learn",
 ]
 
+[project.optional-dependencies]
+vision = ["Pillow"]
+agent = ["transformers"]
+test = ["pytest", "jsonschema>=4"]
+
 [project.scripts]
 iaa-agent = "iaa_agent.cli:app"
 

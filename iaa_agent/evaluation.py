@@ -14,6 +14,7 @@ from queue import Empty, Queue
 
 from .data import NYCDataRepository
 from .engine import IAAAgent, RunConfig
+from .evidence import EvidenceStore
 from .llm import is_live_llm_mode
 from .utils import write_json
 
@@ -37,6 +38,7 @@ class EvaluationResult:
     all_sessions_used_llm: bool | None = None
     all_sessions_used_deepseek: bool | None = None
     stratified_report: dict | None = None
+    candidate_report: dict | None = None
 
     def as_dict(self) -> dict:
         payload = {
@@ -67,7 +69,35 @@ class EvaluationResult:
             payload["all_sessions_used_deepseek"] = self.all_sessions_used_deepseek
         if self.stratified_report is not None:
             payload["stratified"] = self.stratified_report
+        if self.candidate_report is not None:
+            payload["candidate_diagnostics"] = self.candidate_report
         return payload
+
+
+def _candidate_observation(result, query) -> dict:
+    gt = result.ground_truth_poi_id
+    summary = result.candidate_pool_summary
+    history = set(query.history["POI_id"].astype(str)) if query.history is not None else set()
+    predictions = [p.poi_id for p in result.ranked_pois]
+    return {"user_id": str(query.target["user_id"]), "trajectory_id": str(query.target["trajectory_id"]),
+            "ground_truth_poi_id": gt, "predictions": predictions,
+            "rank": predictions.index(gt) + 1 if gt in predictions else None,
+            "in_pool": gt in summary["candidate_poi_ids"],
+            "in_raw": gt in summary["raw_retrieved_poi_ids"],
+            "pool_size": len(summary["candidate_poi_ids"]),
+            "history_status": "IH" if gt in history else "OOH"}
+
+
+def _candidate_report(rows: list[dict]) -> dict:
+    def summarize(subset):
+        n = len(subset)
+        return {"n": n, "CandidateRecall": round(sum(x["in_pool"] for x in subset) / n, 6) if n else 0.0,
+                "RawCandidateRecall": round(sum(x["in_raw"] for x in subset) / n, 6) if n else 0.0,
+                "mean_pool_size": round(sum(x["pool_size"] for x in subset) / n, 3) if n else 0.0}
+    return {"overall": summarize(rows),
+            "by_history": {kind: summarize([x for x in rows if x["history_status"] == kind]) for kind in ("IH", "OOH")},
+            "sessions": sorted(rows, key=lambda x: (x["user_id"], x["trajectory_id"])),
+            "definition": "Pool recall after filtering/reflection; raw recall is the union before filtering. Labels used only after prediction."}
 
 
 def _llm_run_outcome(
@@ -105,6 +135,8 @@ def evaluate_session_split(
     progress_callback: Callable[[], None] | None = None,
     strict_llm: bool = False,
     report_stratified: bool = False,
+    report_candidates: bool = False,
+    evidence_store: EvidenceStore | None = None,
 ) -> EvaluationResult:
     config = run_config or RunConfig(llm_mode=llm_mode)
     repo.use_user_chronological_split(train_ratio)
@@ -125,6 +157,9 @@ def evaluate_session_split(
         and save_runs_dir is None
         and config.llm_mode == "fake"
         and not report_stratified
+        and not report_candidates
+        and not config.evidence_snapshot
+        and evidence_store is None
     )
 
     if use_parallel:
@@ -141,9 +176,10 @@ def evaluate_session_split(
 
     # 串行路径(原始行为,workers<=1 或需保存 trace 时):预热一次全局结构(P3),再顺序评估。
     repo.prewarm_global_structures()
-    agent = IAAAgent(repo, config)
+    agent = IAAAgent(repo, config, evidence_store=evidence_store)
     ranks: list[int | None] = []
     labels: list[dict[str, str]] = []
+    candidate_rows: list[dict] = []
     run_records: list[dict] | None = [] if save_runs_dir is not None else None
     fallback_count = 0
     usage_missing_count = 0
@@ -161,6 +197,8 @@ def evaluate_session_split(
         predicted = [item.poi_id for item in result.ranked_pois]
         rank = predicted.index(gt) + 1 if gt in predicted else None
         ranks.append(rank)
+        if report_candidates or config.evidence_snapshot:
+            candidate_rows.append(_candidate_observation(result, query))
         if report_stratified:
             labels.append(_session_strata_labels(query, gt))
         (
@@ -229,6 +267,8 @@ def evaluate_session_split(
             metrics.all_sessions_used_deepseek = fallback_count == 0
     if report_stratified:
         metrics.stratified_report = build_stratified_report(ranks, labels)
+    if report_candidates or config.evidence_snapshot:
+        metrics.candidate_report = _candidate_report(candidate_rows)
     return metrics
 
 
@@ -246,8 +286,13 @@ def evaluate_session_split_threaded(
     stall_timeout_seconds: int = 0,
     progress_callback: Callable[[], None] | None = None,
     report_stratified: bool = False,
+    report_candidates: bool = False,
+    evidence_store: EvidenceStore | None = None,
 ) -> EvaluationResult:
     config = run_config or RunConfig(llm_mode=llm_mode)
+    if config.evidence_snapshot and evidence_store is None:
+        evidence_store = EvidenceStore(config.evidence_snapshot, config.evidence_mode)
+        evidence_store.validate_repository(repo)
     repo.use_user_chronological_split(train_ratio)
     keys = (
         list(session_keys)
@@ -259,6 +304,8 @@ def evaluate_session_split_threaded(
     if not keys:
         result = _metrics([])
         result.fallback_count = 0
+        if report_candidates or config.evidence_snapshot:
+            result.candidate_report = _candidate_report([])
         return result
 
     max_workers = max(1, min(int(concurrency), len(keys)))
@@ -269,6 +316,7 @@ def evaluate_session_split_threaded(
     usage_missing_count = 0
     llm_status_counts: dict[str, int] = defaultdict(int)
     llm_anomalies: list[dict] = []
+    candidate_rows: list[dict] = []
 
     task_queue: Queue[tuple[int, tuple[str, str]] | None] = Queue()
     result_queue: Queue[tuple[str, object]] = Queue()
@@ -295,7 +343,7 @@ def evaluate_session_split_threaded(
                     train_ratio=train_ratio,
                     min_context=min_context,
                 )
-                agent = IAAAgent(local_repo, config)
+                agent = IAAAgent(local_repo, config, evidence_store=evidence_store)
                 result = agent.run_query(query)
                 gt = result.ground_truth_poi_id
                 predicted = [item.poi_id for item in result.ranked_pois]
@@ -326,6 +374,7 @@ def evaluate_session_split_threaded(
                             finish_reason,
                             uid,
                             tid,
+                            _candidate_observation(result, query) if report_candidates or config.evidence_snapshot else None,
                         ),
                     )
                 )
@@ -372,9 +421,12 @@ def evaluate_session_split_threaded(
                 finish_reason,
                 uid,
                 tid,
+                candidate_observation,
             ) = payload  # type: ignore[misc]
             ranks[int(index)] = rank  # type: ignore[arg-type]
             labels[int(index)] = label  # type: ignore[assignment]
+            if candidate_observation is not None:
+                candidate_rows.append(candidate_observation)
             if is_live_llm_mode(config.llm_mode):
                 llm_status_counts[str(llm_status)] += 1
             if fallback:
@@ -427,6 +479,8 @@ def evaluate_session_split_threaded(
             ranks,
             [label for label in labels if label is not None],
         )
+    if report_candidates or config.evidence_snapshot:
+        metrics.candidate_report = _candidate_report(candidate_rows)
     return metrics
 
 
