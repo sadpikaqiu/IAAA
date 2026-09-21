@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -43,11 +44,12 @@ def log_tail(path, limit=6):
         return [f"Log unavailable: {exc}"]
 
 
-def render(root, interval):
+def render(root, interval, *, height=None):
     now = datetime.now(timezone.utc)
     lines = ["IAAA autonomous experiment | LIVE PROGRESS (read-only)",
              f"Refreshed: {now.astimezone().isoformat(timespec='seconds')} | every {interval:g}s",
              f"Experiment: {root.name}", ""]
+    state = None
     try:
         state = json.loads((root / "results" / "progress.json").read_text(encoding="utf-8"))
         if not isinstance(state, dict):
@@ -73,6 +75,26 @@ def render(root, interval):
               "text = trajectory only; both = trajectory + review/image evidence.",
               "Screen: Ctrl-a then 0 = runner log; Ctrl-a then 1 = progress; Ctrl-a then d = detach.",
               "This viewer does not change predictions, requests, or the experiment protocol."]
+    if height is not None and len(lines) > height and isinstance(state, dict):
+        # A detached screen is often 80x24. More concurrent sessions must not
+        # scroll the status/counts off screen on every refresh. Rotate pages of
+        # active sessions while keeping the header and controls visible.
+        header = lines[:3] + lines[4:8]
+        if state.get("error"):
+            header.append(f"ERROR: {state.get('error_type', '')}: {state['error']}")
+        footer = ["Completed: " + ", ".join(map(str, state.get("completed_stages", []))),
+                  "Latest log: " + (log_tail(root / "runner.log", limit=1) or ["(empty)"])[-1],
+                  "Screen: Ctrl-a then 0=log, 1=progress, d=detach. Read-only viewer."]
+        events = sorted(state.get("active", {}).items())
+        capacity = max(1, height - len(header) - len(footer) - 1)
+        pages = max(1, math.ceil(len(events) / capacity))
+        page_size = max(1, math.ceil(len(events) / pages))
+        page = int(now.timestamp() // interval) % pages
+        selected = events[page * page_size:(page + 1) * page_size]
+        active = [f"{key} | {event.get('detail', '?')} | {age(event.get('at'), now)} ago"
+                  for key, event in selected] or ["No active model events recorded."]
+        lines = header + [f"Active: {len(events)} sessions | page {page + 1}/{pages} (rotates every {interval:g}s)"] + active + footer
+        lines = lines[:max(1, height)]
     # Neutralize terminal control characters in saved error/log text.
     return "\n".join("".join(c if c.isprintable() else " " for c in line) for line in lines)
 
@@ -87,9 +109,12 @@ def main():
         parser.error("--interval must be between 1 and 3600 seconds")
     try:
         while True:
-            output = render(args.experiment_root, args.interval)
+            terminal = shutil.get_terminal_size()
+            interactive = sys.stdout.isatty() and not args.once
+            output = render(args.experiment_root, args.interval,
+                            height=max(1, terminal.lines - 1) if interactive else None)
             if sys.stdout.isatty() and not args.once:
-                width = shutil.get_terminal_size().columns - 1
+                width = terminal.columns - 1
                 output = "\n".join(line[:max(1, width)] for line in output.splitlines())
                 print("\033[H\033[2J" + output, flush=True)
             else:
