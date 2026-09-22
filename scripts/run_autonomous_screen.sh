@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-EXPERIMENT_ROOT="${1:-/home/yzj/IAAA/outputs/experiments/autonomous_v1_20260922_fix05}"
+EXPERIMENT_ROOT="${1:-/home/yzj/IAAA/outputs/experiments/autonomous_v1_20260922_fix06}"
 source /home/yzj/miniconda3/etc/profile.d/conda.sh
 conda activate iaaa
 PYTHON_BIN="$(command -v python)"

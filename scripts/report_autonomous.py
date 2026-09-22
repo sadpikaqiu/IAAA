@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 def render_report(directory):
+    def number(value):
+        return "未观测" if value is None else f"{value:.4f}"
     directory = Path(directory)
     manifest_path = directory / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
@@ -25,18 +27,24 @@ def render_report(directory):
         lines += [f"## {path.stem}", "", f"已处理 {summary['n']}/{summary['expected_n']} 会话；质量通过：{summary['quality']['valid']}。", ""]
         if summary["quality"]["errors"]:
             lines += ["质量错误：" + ", ".join(summary["quality"]["errors"]) + "。以下逐组数值仅诊断已生成结果，不是完整配对指标。", ""]
-        lines += ["| 配置 | n | Hit@1 | Hit@10 | NDCG@10 | 候选召回 | 原始召回 |",
-                  "|---|---:|---:|---:|---:|---:|---:|"]
+        if summary.get("evaluation_policy") == "terminal_arm_failures_v1":
+            lines += ["端到端排名指标包含全部预定会话：终止失败计 0，不补造预测。候选指标只统计已观测的成功输出，单独列出覆盖数。", "",
+                      "双方均成功子集的配对结果仅作辅助，可能有选择偏差；见 JSON 的 conditional_contrasts。", ""]
+        lines += ["| 配置 | n | 失败数/率 | Hit@1 | Hit@10 | NDCG@10 | 候选召回 | 原始召回 | 候选覆盖 n |",
+                  "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for arm, data in summary["arms"].items():
             m = data["overall"]
-            lines.append(f"| {arm} | {data['n']} | {m['Hit@1']:.4f} | {m['Hit@10']:.4f} | {m['NDCG@10']:.4f} | {m['CandidateRecall']:.4f} | {m['RawCandidateRecall']:.4f} |")
-        lines += ["", "| 配置 | 模型请求 | tokens | 会话耗时 P50/P95 (秒) |", "|---|---:|---:|---:|"]
+            lines.append(f"| {arm} | {data['n']} | {data.get('failure_n', 0)} / {data.get('failure_rate', 0):.2%} | {m['Hit@1']:.4f} | {m['Hit@10']:.4f} | {m['NDCG@10']:.4f} | {number(m['CandidateRecall'])} | {number(m['RawCandidateRecall'])} | {data.get('candidate_metric_n', data['n'])} |")
+        lines += ["", "| 配置 | 模型请求 | 已知 tokens | 缺失 usage 请求数 | 会话耗时 P50/P95 (秒) |", "|---|---:|---:|---:|---:|"]
         for arm, data in summary["arms"].items():
             cost = data["cost"]
             if cost.get("granularity") == "historical_full_run_aggregate":
-                lines.append(f"| {arm} | 历史汇总 | {cost['full_run_total_tokens']}（原全量） | 未记录逐会话耗时 |")
+                lines.append(f"| {arm} | 历史汇总 | {cost['full_run_total_tokens']}（原全量） | 见历史审计 | 未记录逐会话耗时 |")
             else:
-                lines.append(f"| {arm} | {cost['requests']} | {cost['total_tokens']} | {cost['elapsed_p50']:.1f} / {cost['elapsed_p95']:.1f} |")
+                lines.append(f"| {arm} | {cost['requests']} | {cost['total_tokens']} | {cost.get('usage_missing_count', 0)} | {cost['elapsed_p50']:.1f} / {cost['elapsed_p95']:.1f} |")
+        if summary.get("physical_request_accounting"):
+            physical = summary["physical_request_accounting"]
+            lines += ["", f"真实请求（共享 A 去重，含失败）：{physical['requests']}；已知 tokens：{physical['total_tokens']}；缺失 usage：{physical['usage_missing']}。"]
         if summary.get("timestamp_ties"):
             lines += ["", f"包含 {len(summary['timestamp_ties'])} 个同时间戳上下文会话；另见 strict_time_sensitivity 报告。"]
         lines += ["", f"逐组分层、配对区间、错误归因和用量：[JSON]({path.relative_to(directory).as_posix()})。", ""]

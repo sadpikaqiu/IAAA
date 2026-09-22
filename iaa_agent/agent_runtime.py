@@ -237,6 +237,7 @@ class JournaledModel:
                 attempt.update(parsed=parsed, raw_content=self.client.last_raw_content,
                                status=self.client.last_call_status, finish_reason=self.client.last_finish_reason,
                                usage=self.client.last_usage, error_type=self.client.last_error_type)
+                attempt["http_status"] = getattr(self.client, "last_http_status", None)
                 if self.client.last_call_status != "success" or self.client.last_finish_reason != "stop":
                     raise ValueError(f"Model response status={self.client.last_call_status}; finish={self.client.last_finish_reason}")
                 if not self.client.last_usage or not self.client.last_usage.get("total_tokens"):
@@ -247,11 +248,15 @@ class JournaledModel:
                 result = current_validator(parsed)
                 attempt["accepted"] = True
             except Exception as exc:
+                attempt["exception_type"] = type(exc).__name__
                 if isinstance(exc, ValidationError):
                     errors = exc.errors(include_url=False, include_context=False, include_input=False)
                     attempt["error"] = canonical(errors)[:2500]
                 else:
                     attempt["error"] = str(exc)[:2500]
+                # Unexpected program errors are not model repair opportunities.
+                if not isinstance(exc, (ValueError, ValidationError)):
+                    raise
             finally:
                 attempt.update(finished_at=now(), elapsed_seconds=time.monotonic() - started)
                 atomic_json(path, record)

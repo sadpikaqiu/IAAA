@@ -14,6 +14,7 @@ from iaa_agent.autonomous import AutonomousAgent, rerank_fixed_result
 from iaa_agent.engine import IAAAgent, RunConfig
 from iaa_agent.models import Intention
 from scripts.mm_ablation_support import prepare_prompt, select_validation
+from scripts.autonomous_failure_policy import SOFT_KINDS
 
 
 ENGINES = ("fixed", "fixed_llm_rank", "fixed_schedule", "autonomous")
@@ -39,6 +40,10 @@ from iaa_agent.agent_evaluation import (FrozenIntentionAgent, legacy_prediction,
 
 
 def metrics(row):
+    if row.get("status") == "failed":
+        return {**dict.fromkeys(("Hit@1", "Hit@5", "Hit@10", "NDCG@10", "MRR@10"), 0.),
+                **dict.fromkeys(("CandidateRecall", "RawCandidateRecall", "ObservedCandidateRecall",
+                                 "mean_pool_size", "mean_raw_size"), None)}
     rank = row["rank"]
     return {"Hit@1": float(rank == 1), "Hit@5": float(rank is not None and rank <= 5),
             "Hit@10": float(rank is not None and rank <= 10),
@@ -80,10 +85,11 @@ def paired_contrast(cases, a, b, draws=2000, permutations=10000):
             "hit10_cluster_permutation_p": (extreme + 1) / (permutations + 1),
             "hit10_gains": sum(c["variants"][a]["rank"] is None and c["variants"][b]["rank"] is not None for c in pairs),
             "hit10_losses": sum(c["variants"][a]["rank"] is not None and c["variants"][b]["rank"] is None for c in pairs),
-            "same_top10": sum(c["variants"][a]["predictions"] == c["variants"][b]["predictions"] for c in pairs)}
+            "same_top10": sum(bool(c["variants"][a]["predictions"]) and
+                              c["variants"][a]["predictions"] == c["variants"][b]["predictions"] for c in pairs)}
 
 
-def quality_errors(cases, expected, arms, *, repeats=False):
+def quality_errors(cases, expected, arms, *, repeats=False, allow_failures=False):
     expected_ids = {(c["user_id"], c["trajectory_id"]) for c in expected}
     actual = [(c["user_id"], c["trajectory_id"]) for c in cases]
     errors = []
@@ -94,15 +100,28 @@ def quality_errors(cases, expected, arms, *, repeats=False):
         names = list(arms)
         if repeats and expected_by_id.get((c["user_id"], c["trajectory_id"]), {}).get("repeat"):
             names += [a + "__repeat" for a in AUTONOMOUS_ARMS]
-        if c["status"] != "completed" or set(c["variants"]) != set(names):
+        terminal = {"completed", "completed_with_failures"} if allow_failures else {"completed"}
+        if c["status"] not in terminal or set(c["variants"]) != set(names):
             errors.append("incomplete_case")
         for name in names:
             row = c["variants"].get(name)
             if row is None:
                 continue
+            if row.get("status") == "failed":
+                if (not allow_failures or row.get("failure_kind") not in SOFT_KINDS
+                        or row.get("predictions") != [] or row.get("rank") is not None
+                        or row.get("valid") is not False or row.get("heuristic_fallback")
+                        or not row.get("error_type") or not row.get("error")):
+                    errors.append("invalid_failure_record")
+                if row.get("failure_kind") == "dependency":
+                    upstream = c["variants"].get(row.get("dependency"), {})
+                    expected_dependency = "fixed__" + name.split("__")[1] if name.startswith("fixed_llm_rank__") else None
+                    if row.get("dependency") != expected_dependency or upstream.get("status") != "failed":
+                        errors.append("invalid_dependency_failure")
+                continue
             if not row.get("valid") or row.get("heuristic_fallback"):
                 errors.append("invalid_or_fallback_prediction")
-            if row["accounting"].get("usage_missing_count"):
+            if row["accounting"].get("usage_missing_count") and not allow_failures:
                 errors.append("usage_missing")
             if row["accounting"].get("requests", 0) < 1:
                 errors.append("no_llm_request")
@@ -113,19 +132,25 @@ def quality_errors(cases, expected, arms, *, repeats=False):
     return sorted(set(errors))
 
 
-def summarize(cases, expected, arms, *, repeats=False, full=False):
-    errors = quality_errors(cases, expected, arms, repeats=repeats)
+def summarize(cases, expected, arms, *, repeats=False, full=False, allow_failures=False):
+    errors = quality_errors(cases, expected, arms, repeats=repeats, allow_failures=allow_failures)
     result = {"n": len(cases), "expected_n": len(expected), "quality": {"valid": not errors, "errors": errors},
               "arms": {}, "contrasts": {}, "created_at": now()}
     result.update(fallback_count=sum(r.get("heuristic_fallback", False) for c in cases for r in c["variants"].values()),
                   usage_missing_count=sum(r["accounting"].get("usage_missing_count", 0) for c in cases for r in c["variants"].values()),
-                  all_sessions_used_llm=not errors)
+                  all_sessions_used_llm=all(r["accounting"].get("requests", 0) > 0
+                      for c in cases for r in c["variants"].values()) and not errors)
+    result["evaluation_policy"] = "terminal_arm_failures_v1" if allow_failures else "strict_all_success"
+    result["accounting_complete"] = result["usage_missing_count"] == 0
+    result["conditional_contrasts"] = {}
     all_arms = list(arms) + ([a + "__repeat" for a in AUTONOMOUS_ARMS] if repeats else [])
     for arm in all_arms:
         subset = [c for c in cases if arm in c["variants"]]
         if not subset:
             continue
         rows = [c["variants"][arm] for c in subset]
+        successful = [r for r in rows if r.get("status") != "failed"]
+        failures = [r for r in rows if r.get("status") == "failed"]
         def average(group):
             if not group:
                 return {}
@@ -135,17 +160,25 @@ def summarize(cases, expected, arms, *, repeats=False, full=False):
                 result[k] = float(np.mean(values)) if values else None
             return result
         result["arms"][arm] = {"n": len(rows), "overall": average(subset),
+            "expected_n": sum(not arm.endswith("__repeat") or c.get("repeat", False) for c in expected),
+            "success_n": len(successful), "failure_n": len(failures), "failure_rate": len(failures) / len(rows),
+            "failure_kinds": {kind: sum(r["failure_kind"] == kind for r in failures)
+                              for kind in sorted({r["failure_kind"] for r in failures})},
+            "candidate_metric_n": len(successful),
+            "metric_denominators": {k: sum(metrics(r)[k] is not None for r in rows) for k in metrics(rows[0])},
             "by_history": {h: {"n": len(g := [c for c in subset if c["history_group"] == h]), **average(g)} for h in ("IH", "OOH")},
             "cost": {"requests": sum(r["accounting"]["requests"] for r in rows),
                      "total_tokens": sum(r["accounting"]["usage"].get("total_tokens", 0) for r in rows),
                      "retries": sum(r["accounting"]["retries"] for r in rows),
+                     "usage_missing_count": sum(r["accounting"].get("usage_missing_count", 0) for r in rows),
+                     "tokens_complete": all(not r["accounting"].get("usage_missing_count", 0) for r in rows),
                      "mean_tool_calls": (float(np.mean([r["tool_calls"] for r in rows if r["tool_calls"] is not None]))
                                          if any(r["tool_calls"] is not None for r in rows) else None),
                      "elapsed_p50": float(np.quantile([r["elapsed_seconds"] for r in rows], .5)),
                      "elapsed_p95": float(np.quantile([r["elapsed_seconds"] for r in rows], .95))},
-            "errors": {"not_retrieved": sum(not r["in_raw"] for r in rows),
-                       "retrieved_not_selected": sum(r["in_raw"] and not r["in_pool"] for r in rows),
-                       "selected_not_top10": sum(r["in_pool"] and r["rank"] is None for r in rows)},
+            "errors": {"not_retrieved": sum(not r["in_raw"] for r in successful),
+                       "retrieved_not_selected": sum(r["in_raw"] and not r["in_pool"] for r in successful),
+                       "selected_not_top10": sum(r["in_pool"] and r["rank"] is None for r in successful)},
             "image_cited": sum(r.get("image_cited", False) for r in rows),
             "review_cited": sum(r.get("review_cited", False) for r in rows),
             "tool_errors": sum(r.get("tool_errors", 0) for r in rows),
@@ -166,6 +199,14 @@ def summarize(cases, expected, arms, *, repeats=False, full=False):
         comparison = paired_contrast(cases, a, b)
         if comparison:
             result["contrasts"][f"{b}_minus_{a}"] = comparison
+            if allow_failures:
+                complete = [c for c in cases if a in c["variants"] and b in c["variants"]
+                            and all(c["variants"][n].get("status") != "failed" for n in (a, b))]
+                conditional = paired_contrast(complete, a, b)
+                result["conditional_contrasts"][f"{b}_minus_{a}"] = {
+                    "eligible_n": comparison["n"], "success_pair_n": len(complete),
+                    "excluded_n": comparison["n"] - len(complete), "statistics": conditional,
+                    "note": "Conditioned on both arms succeeding; selection may be biased. Secondary only."}
     return result
 
 

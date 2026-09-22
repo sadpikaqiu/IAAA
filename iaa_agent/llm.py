@@ -57,6 +57,7 @@ class DeepSeekClient:
         self.last_finish_reason: str | None = None
         self.last_call_status = "not_called"
         self.last_error_type: str | None = None
+        self.last_http_status: int | None = None
         self.usage_totals: dict[str, int] = {
             "prompt_tokens": 0,
             "prompt_cache_hit_tokens": 0,
@@ -79,6 +80,7 @@ class DeepSeekClient:
         self.last_finish_reason = None
         self.last_call_status = "not_called"
         self.last_error_type = None
+        self.last_http_status = None
         if not self.api_key:
             self.last_call_status = "missing_api_key"
             return None
@@ -135,6 +137,7 @@ class DeepSeekClient:
         except (urllib.error.URLError, TimeoutError) as exc:
             self.last_call_status = "request_error"
             self.last_error_type = type(exc).__name__
+            self.last_http_status = getattr(exc, "code", None)
             return None
         try:
             data = json.loads(raw_response)

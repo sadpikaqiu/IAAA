@@ -71,7 +71,7 @@ def render(root, interval, *, height=None):
             lines += ["", f"ERROR: {state.get('error_type', '')}: {state['error']}"]
         lines += ["", "Completed stages: " + ", ".join(map(str, state.get("completed_stages", [])))]
     lines += ["", "Recent runner.log:", *["  " + line for line in log_tail(root / "runner.log")], "",
-              "Session counts advance only after every required arm completes.",
+              "Session counts advance after all required arms reach success or recorded failure.",
               "text = trajectory only; both = trajectory + review/image evidence.",
               "Screen: Ctrl-a then 0 = runner log; Ctrl-a then 1 = progress; Ctrl-a then d = detach.",
               "This viewer does not change predictions, requests, or the experiment protocol."]

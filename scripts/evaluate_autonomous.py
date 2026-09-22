@@ -28,6 +28,11 @@ from iaa_agent.evidence import EvidenceStore
 from scripts.autonomous_eval_support import (ARMS, AUTONOMOUS_ARMS, MODES, select_new_validation,
     run_variant, prediction_row, summarize, holm_adjust, quality_errors, metrics)
 from scripts.report_autonomous import render_report
+from scripts.autonomous_failure_policy import POLICY, ServiceCircuit, failure_row
+
+
+class ServiceUnavailable(RuntimeError):
+    """A latched outage stops evaluation until an explicit restart."""
 
 
 @contextmanager
@@ -58,19 +63,20 @@ def process_lock(path):
 
 def source_hashes():
     paths = list((ROOT / "iaa_agent").glob("*.py"))
-    paths += [ROOT / "scripts" / n for n in ("evaluate_autonomous.py", "autonomous_eval_support.py", "mm_ablation_support.py", "report_autonomous.py")]
+    paths += [ROOT / "scripts" / n for n in ("evaluate_autonomous.py", "autonomous_eval_support.py", "mm_ablation_support.py", "report_autonomous.py", "autonomous_failure_policy.py", "inherit_autonomous_results.py")]
     return {str(p.relative_to(ROOT)).replace("\\", "/"): digest(p.read_bytes()) for p in sorted(paths)}
 
 
-def rolling_results(run, cases, *, concurrency, failure_limit=4):
+def rolling_results(run, cases, *, concurrency, failure_limit=4, should_stop=lambda: False):
     """Bound admitted work, refill completed slots, and drain on failure/interrupt."""
     source = iter(enumerate(cases))
     failures = 0
+    fatal = False
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         pending = {}
 
         def refill():
-            while len(pending) < concurrency:
+            while len(pending) < concurrency and not should_stop():
                 item = next(source, None)
                 if item is None:
                     break
@@ -86,10 +92,11 @@ def rolling_results(run, cases, *, concurrency, failure_limit=4):
                 for future in sorted(done, key=pending.get):
                     pending.pop(future)
                     row = future.result()
-                    failures += row["status"] == "failed"
+                    failures += row["status"] in {"failed", "completed_with_failures"}
+                    fatal = fatal or row.get("fatal_error", False)
                     yield row
                 done = {future for future in pending if future.done()}
-            if failures < failure_limit:
+            if not fatal and (failure_limit is None or failures < failure_limit):
                 refill()
 
 
@@ -204,6 +211,7 @@ def make_manifest(args, config):
                       "scheduler": "bounded_rolling_sessions_v1",
                       "automatic_full": args.full, "development_only": args.development_only,
                       "abort_after_case_failures": 4},
+        "failure_policy": POLICY,
         "statistics": {"bootstrap": 2000, "user_cluster_permutations": 10000, "seed": 42,
                        "primary_validation": ["autonomous__both_minus_fixed_schedule__both", "autonomous__both_minus_autonomous__text"],
                        "primary_full": ["autonomous__both_minus_fixed__both", "autonomous__both_minus_autonomous__text"],
@@ -238,6 +246,8 @@ class Experiment:
         self.stores = {}
         self.baseline_rows = {}
         self.summary_sets = {"validation": {}, "full": {}}
+        self.circuit = ServiceCircuit()
+        self.fatal = threading.Event()
 
     def update(self, **values):
         with self.lock:
@@ -268,17 +278,27 @@ class Experiment:
         path = self.case_path(phase, city, case)
         key = f"{phase}/{city}/{case['user_id']}__{case['trajectory_id']}"
         names = list(arms) + ([a + "__repeat" for a in AUTONOMOUS_ARMS] if repeat and case.get("repeat") else [])
+        saved = None
         if path.exists():
             saved = read_json(path)
             if saved["protocol_sha256"] != self.identity or saved["case"] != case:
                 raise ValueError("Case identity mismatch")
-            if saved["status"] == "completed":
+            if saved.get("fatal_error"):
+                raise ValueError("Cached fatal error requires investigation before resume")
+            if saved["status"] in {"completed", "completed_with_failures"}:
                 if set(saved["variants"]) != set(names):
                     raise ValueError("Incomplete cached arm matrix")
+                if quality_errors([saved], [case], arms, repeats=repeat, allow_failures=True):
+                    raise ValueError("Invalid cached arm matrix")
                 return saved
         output = {"protocol_sha256": self.identity, "case": case, "city": city,
                   "user_id": case["user_id"], "trajectory_id": case["trajectory_id"],
                   "status": "running", "variants": {}, "started_at": now()}
+        if saved:
+            output["variants"] = saved["variants"]
+            for field in ("request_identity", "inherited_from"):
+                if field in saved:
+                    output[field] = saved[field]
         try:
             repo = self.repository(city, ratio)
             query = repo.get_session_query(case["user_id"], case["trajectory_id"], train_ratio=ratio)
@@ -296,17 +316,53 @@ class Experiment:
             for name in ordered:
                 engine, mode, *_ = name.split("__")
                 directory = self.args.output_dir / "runs" / phase / city / f"{case['user_id']}__{case['trajectory_id']}" / name
-                result = run_variant(engine, mode, repo, query, self.stores[city] if mode == "both" else None,
-                    directory, self.identity, self.tokenizer, self.config,
-                    heartbeat=lambda event, detail: self.heartbeat(key, event, name + ":" + detail),
-                    baseline_result=baseline.get(mode))
-                if engine == "fixed":
-                    baseline[mode] = result
-                output["variants"][name] = prediction_row(result, query)
+                if name in output["variants"]:
+                    if engine == "fixed" and output["variants"][name].get("status") != "failed":
+                        # run_variant validates the cached request identity; it makes no request.
+                        baseline[mode] = run_variant(engine, mode, repo, query,
+                            self.stores[city] if mode == "both" else None, directory,
+                            output.get("request_identity", self.identity), self.tokenizer, self.config)
+                    continue
+                if self.circuit.opened or self.fatal.is_set():
+                    output.update(status="paused", pause_reason="service_circuit_open" if self.circuit.opened else "fatal_peer_error")
+                    break
+                def event_callback(event, detail):
+                    self.heartbeat(key, event, name + ":" + detail)
+                    if event == "model_finished":
+                        record = read_json(directory / "calls" / f"{detail}.json")
+                        reason = self.circuit.observe(record["attempts"][-1])
+                        if reason:
+                            self.update(service_circuit=reason)
+                started = time.monotonic()
+                try:
+                    if engine == "fixed_llm_rank" and output["variants"].get("fixed__" + mode, {}).get("status") == "failed":
+                        output["variants"][name] = failure_row(RuntimeError("Upstream A produced no valid prediction"),
+                            directory, dependency="fixed__" + mode,
+                            baseline_accounting=output["variants"]["fixed__" + mode]["accounting"])
+                    else:
+                        result = run_variant(engine, mode, repo, query, self.stores[city] if mode == "both" else None,
+                            directory, output.get("request_identity", self.identity), self.tokenizer, self.config,
+                            heartbeat=event_callback, baseline_result=baseline.get(mode))
+                        if engine == "fixed":
+                            baseline[mode] = result
+                        output["variants"][name] = prediction_row(result, query)
+                except Exception as exc:
+                    row = failure_row(exc, directory, elapsed_seconds=time.monotonic() - started,
+                        baseline_accounting=baseline.get(mode, {}).get("accounting") if engine == "fixed_llm_rank" else None)
+                    row["traceback"] = traceback.format_exc()
+                    output["variants"][name] = row
+                    atomic_json(directory / "failure.json", row)
+                    if row["failure_kind"] == "fatal":
+                        raise
+                if output["variants"][name].get("status") == "failed":
+                    atomic_json(directory / "failure.json", output["variants"][name])
                 atomic_json(path, output)
-            output.update(status="completed", finished_at=now())
+            else:
+                failed = any(r.get("status") == "failed" for r in output["variants"].values())
+                output.update(status="completed_with_failures" if failed else "completed", finished_at=now())
         except Exception as exc:
-            output.update(status="failed", error_type=type(exc).__name__, error=str(exc), traceback=traceback.format_exc(), finished_at=now())
+            self.fatal.set()
+            output.update(status="failed", fatal_error=True, error_type=type(exc).__name__, error=str(exc), traceback=traceback.format_exc(), finished_at=now())
         atomic_json(path, output)
         with self.lock:
             self.state["active"].pop(key, None)
@@ -314,22 +370,24 @@ class Experiment:
 
     def stage(self, phase, city, cases, arms, ratio, repeat=False, stage_label=None):
         label = stage_label or f"{city}_{phase}"
+        tolerant = phase in {"validation", "full"} and not label.endswith("_smoke50")
         self.update(stage=label, completed=0, failed=0, total=len(cases))
         completed, failed = 0, 0
         rows = []
         run = lambda case: self.run_case(phase, city, case, arms, ratio, repeat)
         for row in rolling_results(run, cases, concurrency=self.args.concurrency,
-                                   failure_limit=self.protocol["execution"]["abort_after_case_failures"]):
+                                   failure_limit=None if tolerant else self.protocol["execution"]["abort_after_case_failures"],
+                                   should_stop=lambda: self.circuit.opened or self.fatal.is_set()):
             rows.append(row)
             completed += row["status"] == "completed"
-            failed += row["status"] == "failed"
+            failed += row["status"] in {"failed", "completed_with_failures"}
             self.update(completed=completed, failed=failed)
             print(f"{label}: {completed} completed, {failed} failed / {len(cases)}", flush=True)
         rows.sort(key=lambda c: (c["user_id"], c["trajectory_id"]))
-        summary = summarize(rows, cases, arms, repeats=repeat)
+        summary = summarize(rows, cases, arms, repeats=repeat, allow_failures=tolerant)
         if phase == "full":
-            paired_rows = self.attach_baselines(city, rows)
-            summary = summarize(paired_rows, cases, list(arms) + ["fixed__text", "fixed__both"])
+            paired_rows = self.attach_baselines(city, [r for r in rows if "ground_truth_poi_id" in r])
+            summary = summarize(paired_rows, cases, list(arms) + ["fixed__text", "fixed__both"], allow_failures=tolerant)
             self.annotate_baseline_costs(city, summary, len(cases))
             strict = [c for c in paired_rows if c.get("equal_time_context_count", 0) == 0]
             summary["timestamp_ties"] = [{"user_id": c["user_id"], "trajectory_id": c["trajectory_id"],
@@ -338,7 +396,7 @@ class Experiment:
             if len(strict) != len(paired_rows):
                 strict_ids = {(c["user_id"], c["trajectory_id"]) for c in strict}
                 sensitivity = summarize(strict, [c for c in cases if (c["user_id"], c["trajectory_id"]) in strict_ids],
-                                        list(arms) + ["fixed__text", "fixed__both"])
+                                        list(arms) + ["fixed__text", "fixed__both"], allow_failures=tolerant)
                 self.annotate_baseline_costs(city, sensitivity, len(strict))
                 atomic_json(self.args.output_dir / "summaries" / f"{label}_strict_time_sensitivity.json", sensitivity)
         attempts = []
@@ -353,6 +411,8 @@ class Experiment:
             "note": "Includes unsuccessful cases/attempts; shared A intentions counted once, old baseline requests excluded."}
         atomic_json(self.args.output_dir / "summaries" / f"{label}.json", summary)
         render_report(self.args.output_dir)
+        if self.circuit.opened:
+            raise ServiceUnavailable("Service circuit opened; inflight arms drained. Inspect service before resuming.")
         if not summary["quality"]["valid"]:
             raise RuntimeError(f"{label}: quality gate failed: {summary['quality']['errors']}")
         self.state["completed_stages"].append(label)
@@ -509,7 +569,7 @@ def main():
         try:
             experiment.execute()
         except BaseException as exc:
-            experiment.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "failed",
+            experiment.update(status="interrupted" if isinstance(exc, KeyboardInterrupt) else "paused" if isinstance(exc, ServiceUnavailable) else "failed",
                               error_type=type(exc).__name__, error=str(exc), finished_at=now())
             render_report(args.output_dir)
             raise
