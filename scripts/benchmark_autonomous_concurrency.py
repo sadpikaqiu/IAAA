@@ -96,7 +96,11 @@ def build_validator(item):
         facts = [dict(zip(table["columns"], row)) for row in table["rows"]]
         refs = {row["ref"]: row["poi_idx"] for row in facts}
         refs.update({row["ref"]: row["poi_idx"] for row in payload["external_evidence"]})
-        validate = lambda raw: validate_ranking(raw, [row["poi_idx"] for row in facts], refs, payload["top_k"])
+        def validate(raw):
+            if "ranked_pois_by_id" in schema.get("properties", {}):
+                from iaa_agent.autonomous import decode_ranked_selection
+                raw = decode_ranked_selection(raw, payload["top_k"])
+            return validate_ranking(raw, [row["poi_idx"] for row in facts], refs, payload["top_k"])
     elif item["kind"] == "decision":
         branch = schema.get("anyOf", [schema])[0]
         ids = branch["properties"]["working_poi_selection"]["properties"]

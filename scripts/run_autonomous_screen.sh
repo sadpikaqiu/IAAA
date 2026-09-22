@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-EXPERIMENT_ROOT="${1:-/home/yzj/IAAA/outputs/experiments/autonomous_v1_20260921_fix03}"
+EXPERIMENT_ROOT="${1:-/home/yzj/IAAA/outputs/experiments/autonomous_v1_20260922_fix04}"
 source /home/yzj/miniconda3/etc/profile.d/conda.sh
 conda activate iaaa
 cd "$EXPERIMENT_ROOT/code"
@@ -28,4 +28,4 @@ python scripts/evaluate_autonomous.py \
   --output-dir "$EXPERIMENT_ROOT/results" \
   --tokenizer-path /home/yzj/Model/Qwen38-27B \
   --cities NYC TKY --development-size 50 --validation-size 500 --repeat-size 100 \
-  --concurrency 4 --full
+  --concurrency 16 --full

@@ -59,3 +59,72 @@ def test_holm_family_is_explicit_and_monotonic():
     assert adjusted["TKY"]["contrasts"]["one"]["hit10_holm_p"] == .06
     assert adjusted["NYC"]["contrasts"]["two"]["hit10_holm_p"] == .08
     assert adjusted["TKY"]["contrasts"]["two"]["holm_family_size"] == 4
+
+
+def test_rolling_queue_refills_while_an_earlier_case_is_still_running():
+    import threading
+    from scripts.evaluate_autonomous import rolling_results
+    replacement_started = threading.Event()
+    lock = threading.Lock()
+    active, peak, calls = 0, 0, []
+    def run(case):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            calls.append(case)
+        try:
+            if case == 0:
+                assert replacement_started.wait(3), "Batch barrier left a worker idle"
+            elif case == 2:
+                replacement_started.set()
+            return {"status": "completed", "case": case}
+        finally:
+            with lock:
+                active -= 1
+    rows = list(rolling_results(run, range(6), concurrency=2))
+    assert sorted(calls) == list(range(6))
+    assert sorted(r["case"] for r in rows) == list(range(6))
+    assert peak == 2
+
+
+def test_rolling_queue_stops_admission_at_failure_gate_but_drains_inflight():
+    import threading
+    from scripts.evaluate_autonomous import rolling_results
+    both_started = threading.Barrier(2)
+    finish_other = threading.Event()
+    calls = []
+    def run(case):
+        calls.append(case)
+        both_started.wait(timeout=3)
+        if case == 0:
+            return {"status": "failed", "case": case}
+        assert finish_other.wait(3)
+        return {"status": "completed", "case": case}
+    stream = rolling_results(run, range(10), concurrency=2, failure_limit=1)
+    first = next(stream)
+    assert first == {"status": "failed", "case": 0}
+    finish_other.set()
+    assert list(stream) == [{"status": "completed", "case": 1}]
+    assert sorted(calls) == [0, 1]
+
+
+def test_rolling_queue_counts_all_ready_failures_before_refill(monkeypatch):
+    from concurrent.futures import Future
+    import scripts.evaluate_autonomous as runner
+    calls = []
+    class ImmediateExecutor:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def submit(self, run, case):
+            future = Future()
+            future.set_result(run(case))
+            return future
+    monkeypatch.setattr(runner, "ThreadPoolExecutor", ImmediateExecutor)
+    def run(case):
+        calls.append(case)
+        return {"status": "failed", "case": case}
+    rows = list(runner.rolling_results(run, range(100), concurrency=4, failure_limit=2))
+    assert calls == [0, 1, 2, 3]
+    assert len(rows) == 4

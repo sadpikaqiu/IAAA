@@ -49,6 +49,9 @@ class ScriptedClient:
                 "affordances": {k: "uncertain" for k in ("category", "spatial", "temporal", "revisit", "transition")},
                 "evidence_refs": ["invented" if self.bad_rank else r[-1]],
                 "missing_evidence": [], "conflicts": []} for r in rows[:payload["top_k"]]]}
+            selected = {entry["poi_idx"]: {"rank": rank, **{k: v for k, v in entry.items() if k != "poi_idx"}}
+                        for rank, entry in enumerate(result["ranked_pois"], 1)}
+            result = {"ranked_pois_by_id": dict(sorted(selected.items()))}
         else:
             for obs in payload["latest_observations"]:
                 for row in obs.get("result", {}).get("candidate_rows", []):
@@ -247,12 +250,13 @@ def test_duplicate_repair_receives_previous_answer_and_specific_ids(fixture, tmp
         bad_response = None
         def chat_json(self, messages, **kwargs):
             result = super().chat_json(messages, **kwargs)
-            rank = "ranked_pois" in result
+            rank = "ranked_pois_by_id" in result
             ready = rank if failure_stage == "ranking" else bool(result.get("working_poi_selection"))
             if self.bad_response is None and ready:
                 result = deepcopy(result)
                 if rank:
-                    result["ranked_pois"][1] = deepcopy(result["ranked_pois"][0])
+                    entries = list(result["ranked_pois_by_id"].values())
+                    entries[1]["rank"] = entries[0]["rank"]
                 self.bad_response = deepcopy(result)
                 self.last_raw_content = json.dumps(result)
                 if not rank:
@@ -268,8 +272,8 @@ def test_duplicate_repair_receives_previous_answer_and_specific_ids(fixture, tmp
     assert len(repairs) == 1
     assert json.loads(repairs[0][-2]["content"]) == client.bad_response
     if failure_stage == "ranking":
-        assert "1-based positions" in repairs[0][-1]["content"]
-        assert "[1, 2]" in repairs[0][-1]["content"]
+        assert "Preference ranks must use every integer" in repairs[0][-1]["content"]
+        assert next(iter(client.bad_response["ranked_pois_by_id"])) in repairs[0][-1]["content"]
     else:
         assert "Duplicate JSON object key" in repairs[0][-1]["content"]
         assert next(iter(client.bad_response["working_poi_selection"])) in repairs[0][-1]["content"]

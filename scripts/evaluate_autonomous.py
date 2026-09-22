@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import contextmanager
 from dataclasses import asdict
 import importlib.metadata
@@ -60,6 +60,37 @@ def source_hashes():
     paths = list((ROOT / "iaa_agent").glob("*.py"))
     paths += [ROOT / "scripts" / n for n in ("evaluate_autonomous.py", "autonomous_eval_support.py", "mm_ablation_support.py", "report_autonomous.py")]
     return {str(p.relative_to(ROOT)).replace("\\", "/"): digest(p.read_bytes()) for p in sorted(paths)}
+
+
+def rolling_results(run, cases, *, concurrency, failure_limit=4):
+    """Bound admitted work, refill completed slots, and drain on failure/interrupt."""
+    source = iter(enumerate(cases))
+    failures = 0
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending = {}
+
+        def refill():
+            while len(pending) < concurrency:
+                item = next(source, None)
+                if item is None:
+                    break
+                index, case = item
+                pending[pool.submit(run, case)] = index
+
+        refill()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            # Account for every ready result before admitting replacements. This
+            # keeps a burst of provider failures from bypassing the stop gate.
+            while done:
+                for future in sorted(done, key=pending.get):
+                    pending.pop(future)
+                    row = future.result()
+                    failures += row["status"] == "failed"
+                    yield row
+                done = {future for future in pending if future.done()}
+            if failures < failure_limit:
+                refill()
 
 
 def baseline_audit(args, city, repo, store):
@@ -170,6 +201,7 @@ def make_manifest(args, config):
                   "context_ties": "retain original session sequence; flag ties and report strict-time sensitivity",
                   "history_boundary": "strictly before target timestamp"},
         "execution": {"cities": args.cities, "concurrency": args.concurrency,
+                      "scheduler": "bounded_rolling_sessions_v1",
                       "automatic_full": args.full, "development_only": args.development_only,
                       "abort_after_case_failures": 4},
         "statistics": {"bootstrap": 2000, "user_cluster_permutations": 10000, "seed": 42,
@@ -285,20 +317,14 @@ class Experiment:
         self.update(stage=label, completed=0, failed=0, total=len(cases))
         completed, failed = 0, 0
         rows = []
-        # Submit in small batches so a provider-wide failure does not waste the entire run.
-        with ThreadPoolExecutor(max_workers=self.args.concurrency) as pool:
-            for start in range(0, len(cases), self.args.concurrency):
-                futures = [pool.submit(self.run_case, phase, city, c, arms, ratio, repeat)
-                           for c in cases[start:start + self.args.concurrency]]
-                for future in as_completed(futures):
-                    row = future.result()
-                    rows.append(row)
-                    completed += row["status"] == "completed"
-                    failed += row["status"] == "failed"
-                    self.update(completed=completed, failed=failed)
-                    print(f"{label}: {completed} completed, {failed} failed / {len(cases)}", flush=True)
-                if failed >= 4:
-                    break
+        run = lambda case: self.run_case(phase, city, case, arms, ratio, repeat)
+        for row in rolling_results(run, cases, concurrency=self.args.concurrency,
+                                   failure_limit=self.protocol["execution"]["abort_after_case_failures"]):
+            rows.append(row)
+            completed += row["status"] == "completed"
+            failed += row["status"] == "failed"
+            self.update(completed=completed, failed=failed)
+            print(f"{label}: {completed} completed, {failed} failed / {len(cases)}", flush=True)
         rows.sort(key=lambda c: (c["user_id"], c["trajectory_id"]))
         summary = summarize(rows, cases, arms, repeats=repeat)
         if phase == "full":

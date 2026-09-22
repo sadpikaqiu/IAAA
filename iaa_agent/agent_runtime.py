@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -55,8 +56,20 @@ class PromptBudget:
         self.tokenizer, self.limit = tokenizer, limit
 
     def count(self, messages):
-        return len(self.tokenizer.apply_chat_template(messages, tokenize=True,
-                    add_generation_prompt=True, enable_thinking=False))
+        encoded = self.tokenizer.apply_chat_template(messages, tokenize=True,
+                    add_generation_prompt=True, enable_thinking=False,
+                    preserve_thinking=False, return_dict=False)
+        # Newer Transformers may return BatchEncoding by default: len(mapping)
+        # counts fields (usually 2), not tokens. Also tolerate that return shape
+        # from adapters which ignore return_dict=False.
+        ids = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
+        if not isinstance(ids, (list, tuple)):
+            raise ValueError("Expected token IDs for one chat prompt")
+        if ids and isinstance(ids[0], (list, tuple)):
+            if len(ids) != 1:
+                raise ValueError("Prompt budget expects exactly one conversation")
+            ids = ids[0]
+        return len(ids)
 
     def clip(self, text, limit):
         tokens = self.tokenizer.encode(str(text), add_special_tokens=False)
@@ -135,6 +148,9 @@ class JournaledModel:
             if isinstance(parsed.get("ranked_pois"), list):
                 projection["ranked_pois"] = [{k: p.get(k) for k in ("poi_idx", "evidence_refs")}
                                              for p in parsed["ranked_pois"] if isinstance(p, dict)]
+            if isinstance(parsed.get("ranked_pois_by_id"), dict):
+                projection["ranked_pois_by_id"] = {idx: {k: p.get(k) for k in ("rank", "evidence_refs")}
+                    for idx, p in parsed["ranked_pois_by_id"].items() if isinstance(p, dict)}
         for cap in (640, 320, 160, 0):
             previous_text = ("\nPrevious invalid answer, identifier summary: " +
                              self.budget.clip(canonical(projection), cap)) if projection and cap else ""
@@ -180,7 +196,8 @@ class JournaledModel:
             if prompt_count + max_tokens > 16384 or (schema is not None and prompt_count > self.budget.limit):
                 raise ValueError("context_budget_exceeded at request dispatch")
             attempt = {"started_at": now(), "status": "inflight_or_interrupted", "accepted": False,
-                       "request_messages": current, "repair_context": repair_context, "usage": None}
+                       "request_messages": current, "repair_context": repair_context, "usage": None,
+                       "estimated_prompt_tokens": prompt_count}
             record["attempts"].append(attempt)
             atomic_json(path, record)
             self.heartbeat("model_started", label)
