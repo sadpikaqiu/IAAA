@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -11,6 +12,15 @@ import time
 from pydantic import ValidationError
 
 from .llm import DeepSeekClient, _extract_json
+
+
+@dataclass
+class RepairRequest:
+    messages: list
+    schema: dict
+    validator: object
+    context: str
+    metadata: dict
 
 
 def canonical(value):
@@ -159,7 +169,7 @@ class JournaledModel:
                 return candidate, "identifier_summary" if previous_text else "diagnostic_only"
         raise ValueError("context_budget_exceeded: cannot fit repair feedback without dropping original facts")
 
-    def call(self, label, messages, max_tokens, validator, *, schema=None):
+    def call(self, label, messages, max_tokens, validator, *, schema=None, repair_builder=None):
         options = {"max_tokens": max_tokens, "temperature": 0, "seed": 42,
                    "chat_template_kwargs": {"enable_thinking": False, "preserve_thinking": False}}
         if schema is not None:
@@ -167,6 +177,22 @@ class JournaledModel:
                 "name": "iaaa_" + label, "schema": schema, "strict": True}}
         identity = {"experiment": self.identity, "model": self.client.model,
                     "base_url": self.client.base_url, "messages": digest(messages), "options": options}
+        if repair_builder is not None:
+            identity["repair_protocol"] = repair_builder.protocol
+
+        def request_for(prior):
+            current = copy.deepcopy(messages)
+            current_options = copy.deepcopy(options)
+            current_validator, context, metadata = validator, None, None
+            if prior:
+                custom = repair_builder(prior) if repair_builder is not None else None
+                if custom is not None:
+                    current, current_validator = custom.messages, custom.validator
+                    context, metadata = custom.context, custom.metadata
+                    current_options["response_format"]["json_schema"]["schema"] = custom.schema
+                else:
+                    current, context = self.repair_messages(current, prior, max_tokens, structured=schema is not None)
+            return current, current_options, current_validator, context, metadata
         path = self.directory / f"{label}.json"
         if path.exists():
             record = read_json(path)
@@ -175,10 +201,16 @@ class JournaledModel:
         else:
             record = {"identity": identity, "messages": messages, "attempts": []}
         self.used_labels.append(label)
-        for a in record["attempts"]:
+        for index, a in enumerate(record["attempts"]):
             if a.get("accepted"):
                 if schema is not None and strict_response_json(a.get("raw_content")) != a["parsed"]:
                     raise ValueError(f"Cached raw/parsed response mismatch: {label}")
+                if repair_builder is not None:
+                    current, current_options, current_validator, context, metadata = request_for(record["attempts"][:index])
+                    if (a.get("request_messages") != current or a.get("request_options") != current_options
+                            or a.get("repair_context") != context or a.get("repair_metadata") != metadata):
+                        raise ValueError(f"Cached repair request mismatch: {label}")
+                    return current_validator(a["parsed"])
                 return validator(a["parsed"])
         while True:
             retries = self.accounting()["retries"]
@@ -187,23 +219,20 @@ class JournaledModel:
             remaining = self.config.case_timeout - (time.monotonic() - self.started)
             if remaining <= 0:
                 raise TimeoutError("Agent case deadline exceeded")
-            current = copy.deepcopy(messages)
-            repair_context = None
-            if record["attempts"]:
-                current, repair_context = self.repair_messages(current, record["attempts"], max_tokens,
-                                                               structured=schema is not None)
+            current, current_options, current_validator, repair_context, metadata = request_for(record["attempts"])
             prompt_count = self.budget.count(current)
             if prompt_count + max_tokens > 16384 or (schema is not None and prompt_count > self.budget.limit):
                 raise ValueError("context_budget_exceeded at request dispatch")
             attempt = {"started_at": now(), "status": "inflight_or_interrupted", "accepted": False,
                        "request_messages": current, "repair_context": repair_context, "usage": None,
-                       "estimated_prompt_tokens": prompt_count}
+                       "estimated_prompt_tokens": prompt_count, "request_options": current_options,
+                       "repair_metadata": metadata}
             record["attempts"].append(attempt)
             atomic_json(path, record)
             self.heartbeat("model_started", label)
             started = time.monotonic()
             try:
-                parsed = self.client.chat_json(current, max_tokens=max_tokens, request_options=options,
+                parsed = self.client.chat_json(current, max_tokens=max_tokens, request_options=current_options,
                                                timeout_seconds=min(remaining, self.config.request_timeout))
                 attempt.update(parsed=parsed, raw_content=self.client.last_raw_content,
                                status=self.client.last_call_status, finish_reason=self.client.last_finish_reason,
@@ -215,7 +244,7 @@ class JournaledModel:
                 if schema is not None:
                     parsed = strict_response_json(self.client.last_raw_content)
                     attempt["parsed"] = parsed
-                result = validator(parsed)
+                result = current_validator(parsed)
                 attempt["accepted"] = True
             except Exception as exc:
                 if isinstance(exc, ValidationError):

@@ -45,13 +45,13 @@ class ScriptedClient:
         payload = json.loads(messages[1]["content"])
         if "candidate_facts" in payload:
             rows = payload["candidate_facts"]["rows"]
+            contract = kwargs["request_options"]["response_format"]["json_schema"]["schema"]["properties"]["ranked_pois"]
+            allowed = {entry["properties"]["poi_idx"]["const"] for entry in contract["items"]["anyOf"]}
+            rows = [r for r in rows if r[0] in allowed]
             result = {"ranked_pois": [{"poi_idx": r[0], "reason": "Supported by recorded history.",
                 "affordances": {k: "uncertain" for k in ("category", "spatial", "temporal", "revisit", "transition")},
                 "evidence_refs": ["invented" if self.bad_rank else r[-1]],
-                "missing_evidence": [], "conflicts": []} for r in rows[:payload["top_k"]]]}
-            selected = {entry["poi_idx"]: {"rank": rank, **{k: v for k, v in entry.items() if k != "poi_idx"}}
-                        for rank, entry in enumerate(result["ranked_pois"], 1)}
-            result = {"ranked_pois_by_id": dict(sorted(selected.items()))}
+                "missing_evidence": [], "conflicts": []} for r in rows[:contract["minItems"]]]}
         else:
             for obs in payload["latest_observations"]:
                 for row in obs.get("result", {}).get("candidate_rows", []):
@@ -250,13 +250,12 @@ def test_duplicate_repair_receives_previous_answer_and_specific_ids(fixture, tmp
         bad_response = None
         def chat_json(self, messages, **kwargs):
             result = super().chat_json(messages, **kwargs)
-            rank = "ranked_pois_by_id" in result
+            rank = "ranked_pois" in result
             ready = rank if failure_stage == "ranking" else bool(result.get("working_poi_selection"))
             if self.bad_response is None and ready:
                 result = deepcopy(result)
                 if rank:
-                    entries = list(result["ranked_pois_by_id"].values())
-                    entries[1]["rank"] = entries[0]["rank"]
+                    result["ranked_pois"][1] = deepcopy(result["ranked_pois"][0])
                 self.bad_response = deepcopy(result)
                 self.last_raw_content = json.dumps(result)
                 if not rank:
@@ -270,11 +269,12 @@ def test_duplicate_repair_receives_previous_answer_and_specific_ids(fixture, tmp
     result = AutonomousAgent(tools, model(tmp_path, config, client), config).run()
     repairs = [messages for messages, _ in client.calls if len(messages) > 2]
     assert len(repairs) == 1
-    assert json.loads(repairs[0][-2]["content"]) == client.bad_response
     if failure_stage == "ranking":
-        assert "Preference ranks must use every integer" in repairs[0][-1]["content"]
-        assert next(iter(client.bad_response["ranked_pois_by_id"])) in repairs[0][-1]["content"]
+        assert "Return ONLY 1 additional DISTINCT POIs" in repairs[0][-1]["content"]
+        assert client.bad_response["ranked_pois"][0]["poi_idx"] in repairs[0][-1]["content"]
+        assert result["ranked_pois"][0]["poi_idx"] == client.bad_response["ranked_pois"][0]["poi_idx"]
     else:
+        assert json.loads(repairs[0][-2]["content"]) == client.bad_response
         assert "Duplicate JSON object key" in repairs[0][-1]["content"]
         assert next(iter(client.bad_response["working_poi_selection"])) in repairs[0][-1]["content"]
     assert result["accounting"]["retries"] == 1

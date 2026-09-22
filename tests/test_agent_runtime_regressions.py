@@ -4,7 +4,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from iaa_agent.agent_runtime import PromptBudget, strict_response_json
-from iaa_agent.autonomous import decode_ranked_selection, ranking_selection_schema, validate_ranking
+from iaa_agent.autonomous import decode_ranked_selection, ranking_array_schema, validate_ranking
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -48,22 +48,21 @@ def test_rank_decoder_rejects_duplicate_out_of_range_or_non_integer_ranks(value)
 
 
 def test_rank_schema_binds_refs_to_poi_and_enforces_exact_selection_size():
-    schema = ranking_selection_schema(["P1", "P2", "P3"], {"F1": "P1", "F2": "P2", "F3": "P3"}, 2)
+    schema = ranking_array_schema(["P1", "P2", "P3"], {"F1": "P1", "F2": "P2", "F3": "P3"}, 2)
     validator = Draft202012Validator(schema)
-    good = ranking()
+    good = decode_ranked_selection(ranking(), 2)
     assert validator.is_valid(good)
     wrong_ref = deepcopy(good)
-    wrong_ref["ranked_pois_by_id"]["P1"]["evidence_refs"] = ["F2"]
+    wrong_ref["ranked_pois"][0]["evidence_refs"] = ["F1"]
     assert not validator.is_valid(wrong_ref)
     fewer = deepcopy(good)
-    fewer["ranked_pois_by_id"].pop("P1")
+    fewer["ranked_pois"].pop()
     assert not validator.is_valid(fewer)
     more = deepcopy(good)
-    more["ranked_pois_by_id"]["P3"] = deepcopy(good["ranked_pois_by_id"]["P1"])
-    more["ranked_pois_by_id"]["P3"]["evidence_refs"] = ["F3"]
+    more["ranked_pois"].append(deepcopy(good["ranked_pois"][0]))
     assert not validator.is_valid(more)
     unknown = deepcopy(good)
-    unknown["ranked_pois_by_id"]["P4"] = unknown["ranked_pois_by_id"].pop("P1")
+    unknown["ranked_pois"][0]["poi_idx"] = "P4"
     assert not validator.is_valid(unknown)
     with pytest.raises(ValueError, match="Duplicate JSON object key"):
         strict_response_json('{"ranked_pois_by_id":{"P1":{"rank":1},"P1":{"rank":2}}}')
