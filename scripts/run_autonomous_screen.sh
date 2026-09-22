@@ -3,6 +3,7 @@ set -euo pipefail
 EXPERIMENT_ROOT="${1:-/home/yzj/IAAA/outputs/experiments/autonomous_v1_20260922_fix04}"
 source /home/yzj/miniconda3/etc/profile.d/conda.sh
 conda activate iaaa
+PYTHON_BIN="$(command -v python)"
 cd "$EXPERIMENT_ROOT/code"
 export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
@@ -16,11 +17,12 @@ if [[ -n "${STY:-}" && -f "$MONITOR" ]] && command -v screen >/dev/null 2>&1; th
   # A missing -p window can still make `screen -Q title` return success.
   # Inspect the actual window list instead of trusting that exit status.
   if [[ "$(screen -S "$STY" -Q windows)" != *" progress"* ]]; then
-    screen -S "$STY" -X screen -t progress python -u "$MONITOR" "$EXPERIMENT_ROOT" --interval 10 || true
+    # New windows inherit the screen server's pre-conda PATH, not this shell's.
+    screen -S "$STY" -X screen -t progress "$PYTHON_BIN" -u "$MONITOR" "$EXPERIMENT_ROOT" --interval 10 || true
   fi
   screen -S "$STY" -X select progress || true
 fi
-python scripts/evaluate_autonomous.py \
+"$PYTHON_BIN" scripts/evaluate_autonomous.py \
   --data-root /home/yzj/IAAA/datasets \
   --source-experiment /home/yzj/IAAA/outputs/experiments/mm_pipeline_20260914 \
   --source-ablation /home/yzj/IAAA/outputs/experiments/mm_ablation_20260917 \
